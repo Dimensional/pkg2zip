@@ -13,6 +13,61 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+static void sys_remove_tree_real_w(const WCHAR* path)
+{
+    DWORD attr = GetFileAttributesW(path);
+    if (attr == INVALID_FILE_ATTRIBUTES)
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+        {
+            return;
+        }
+        sys_error("ERROR: cannot inspect path for removal\n");
+    }
+
+    if ((attr & FILE_ATTRIBUTE_DIRECTORY) == 0)
+    {
+        if (!DeleteFileW(path) && GetLastError() != ERROR_FILE_NOT_FOUND)
+        {
+            sys_error("ERROR: cannot remove file\n");
+        }
+        return;
+    }
+
+    {
+        WCHAR pattern[MAX_PATH];
+        WIN32_FIND_DATAW entry;
+        HANDLE find;
+
+        swprintf(pattern, MAX_PATH, L"%ls\\*", path);
+        find = FindFirstFileW(pattern, &entry);
+        if (find != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                WCHAR child[MAX_PATH];
+
+                if (wcscmp(entry.cFileName, L".") == 0 || wcscmp(entry.cFileName, L"..") == 0)
+                {
+                    continue;
+                }
+
+                swprintf(child, MAX_PATH, L"%ls\\%ls", path, entry.cFileName);
+                sys_remove_tree_real_w(child);
+            }
+            while (FindNextFileW(find, &entry) != 0);
+
+            FindClose(find);
+        }
+    }
+
+    if (!RemoveDirectoryW(path) && GetLastError() != ERROR_PATH_NOT_FOUND)
+    {
+        sys_error("ERROR: cannot remove folder\n");
+    }
+}
+
 static HANDLE gStdout;
 static int gStdoutRedirected;
 static UINT gOldCP;
@@ -167,10 +222,64 @@ void sys_write(sys_file file, uint64_t offset, const void* buffer, uint32_t size
 
 #define _FILE_OFFSET_BITS 64
 #include <stdio.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sys/stat.h>
+
+static void sys_remove_tree_real(const char* path)
+{
+    struct stat st;
+
+    if (lstat(path, &st) != 0)
+    {
+        if (errno == ENOENT)
+        {
+            return;
+        }
+        sys_error("ERROR: cannot inspect '%s' for removal\n", path);
+    }
+
+    if (!S_ISDIR(st.st_mode))
+    {
+        if (unlink(path) != 0 && errno != ENOENT)
+        {
+            sys_error("ERROR: cannot remove '%s' file\n", path);
+        }
+        return;
+    }
+
+    {
+        DIR* dir = opendir(path);
+        struct dirent* entry;
+
+        if (dir == NULL)
+        {
+            sys_error("ERROR: cannot open '%s' folder for removal\n", path);
+        }
+
+        while ((entry = readdir(dir)) != NULL)
+        {
+            char child[1024];
+
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            {
+                continue;
+            }
+
+            snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+            sys_remove_tree_real(child);
+        }
+
+        closedir(dir);
+    }
+
+    if (rmdir(path) != 0 && errno != ENOENT)
+    {
+        sys_error("ERROR: cannot remove '%s' folder\n", path);
+    }
+}
 
 static int gStdoutRedirected;
 
@@ -359,4 +468,22 @@ int sys_test_dir(const char* const path)
     }
 
     return ( info.st_mode & S_IFDIR ) ? 1 : 0;
+}
+
+void sys_remove_tree(const char* path)
+{
+    if (path == NULL || path[0] == 0)
+    {
+        return;
+    }
+
+#if defined(_WIN32)
+    {
+        WCHAR wpath[MAX_PATH];
+        MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH);
+        sys_remove_tree_real_w(wpath);
+    }
+#else
+    sys_remove_tree_real(path);
+#endif
 }

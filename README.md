@@ -4,7 +4,8 @@
 
 Utility that decrypts PlayStation Vita pkg file and creates zip package. Supported pkg files - main application, DLC, patch, theme and PSM files. Also supports PSX and PSP pkg files for use with [Adrenaline][].
 
-Optionally writes [NoNpDrm][] or [NoPsmDrm][] fake license file from zRIF string. You must provide license key.
+Optionally writes [NoNpDrm][] or [NoPsmDrm][] fake license file from zRIF string. You must provide the key.
+Vita titles can also be extracted and decrypted into a `[npdrm-removed]` tree with `-x -n`. Key is required.
 
 # Requirements
 
@@ -22,6 +23,7 @@ Optionally writes [NoNpDrm][] or [NoPsmDrm][] fake license file from zRIF string
 * **small**, has no external library dependencies and uses very minimal dynamic memory allocations.
 * **fast**, uses AESNI hardware accelerated AES decryption if supported by CPU (requires [AESNI][] and [SSSE3][] instructions).
 * **simple**, creates zip package with same folder structure that Vita expects (just drag & drop all file from zip archive to ux0:). Zip file is created directly from pkg without any intermediate temporary files.
+* **Vita NPDRM removal**, extracts a Vita title and emits a decrypted `[npdrm-removed]` output tree in one command.
 * **Vita DLC**, **Vita PATCH** and **PSM** pkg unpacking.
 * **PSX**, **PSP**, **PSP Updates**, **PSP DLC**, and **PSP THEME** pkg unpacking.
 
@@ -51,11 +53,18 @@ To avoid zipping process and create individual files, use `-x` argument (must co
 
     pkg2zip -x package.pkg [zRIF_STRING]
 
+To extract a Vita title and remove NPDRM in one step, use `-x -n` and pass the zRIF as the final positional argument:
+
+    pkg2zip -x -n package.pkg zRIF_STRING
+
+This writes the final output as `title [id] [region] [npdrm-removed]`. Extraction uses an internal staging directory and removes it automatically after successful decryption.
+
 To disable bgdl output for VITA Theme extraction, use the '-b' argument.
 
     pkg2zip -b -x package.pkg zRIF_STRING
 
 PSX or PSP pkg files do not require zRIF argument. It will be ignored.
+The positional zRIF argument is required when using `-n` to decrypt VITA pkg files.
 
 For PSP files pkg2zip by default will create a .ISO file. To create a compressed .CSO file pass -cN argument where N is compression factor. For example, for fastest compression use:
 

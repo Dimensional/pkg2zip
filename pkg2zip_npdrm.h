@@ -20,7 +20,6 @@ typedef struct {
     uint32_t rif_size;
     const uint8_t* klicensee;
     uint32_t klicensee_size;
-    const char* f00d_cache_path;
 } npdrm_request;
 
 typedef struct {

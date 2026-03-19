@@ -4,7 +4,6 @@
 #include "pkg2zip_psp.h"
 #include "pkg2zip_utils.h"
 #include "pkg2zip_zrif.h"
-#include "pkg2zip_f00d.h"
 #include "pkg2zip_npdrm.h"
 
 #include <assert.h>
@@ -30,247 +29,6 @@ static const uint8_t pkg_psp_key[] = { 0x07, 0xf2, 0xc6, 0x82, 0x90, 0xb5, 0x0d,
 static const uint8_t pkg_vita_2[] = { 0xe3, 0x1a, 0x70, 0xc9, 0xce, 0x1d, 0xd7, 0x2b, 0xf3, 0xc0, 0x62, 0x29, 0x63, 0xf2, 0xec, 0xcb };
 static const uint8_t pkg_vita_3[] = { 0x42, 0x3a, 0xca, 0x3a, 0x2b, 0xd5, 0x64, 0x9f, 0x96, 0x86, 0xab, 0xad, 0x6f, 0xd8, 0x80, 0x1f };
 static const uint8_t pkg_vita_4[] = { 0xaf, 0x07, 0xfd, 0x59, 0x65, 0x25, 0x27, 0xba, 0xf1, 0x33, 0x89, 0x66, 0x8b, 0x17, 0xd9, 0xea };
-
-static int hex_nibble(int c)
-{
-    if (c >= '0' && c <= '9')
-    {
-        return c - '0';
-    }
-    if (c >= 'a' && c <= 'f')
-    {
-        return 10 + (c - 'a');
-    }
-    if (c >= 'A' && c <= 'F')
-    {
-        return 10 + (c - 'A');
-    }
-    return -1;
-}
-
-static int parse_hex_16(const char* hex, uint8_t out[16])
-{
-    uint32_t i;
-    if (hex == NULL || out == NULL)
-    {
-        return -1;
-    }
-
-    for (i = 0; i < 16; i++)
-    {
-        int hi = hex_nibble(hex[i * 2 + 0]);
-        int lo = hex_nibble(hex[i * 2 + 1]);
-        if (hi < 0 || lo < 0)
-        {
-            return -1;
-        }
-        out[i] = (uint8_t)((hi << 4) | lo);
-    }
-
-    return hex[32] == 0 ? 0 : -1;
-}
-
-static void print_hex_16(const uint8_t in[16])
-{
-    static const char* kHex = "0123456789abcdef";
-    char out[33];
-    uint32_t i;
-
-    for (i = 0; i < 16; i++)
-    {
-        out[i * 2 + 0] = kHex[(in[i] >> 4) & 0xF];
-        out[i * 2 + 1] = kHex[in[i] & 0xF];
-    }
-    out[32] = 0;
-    sys_output("%s\n", out);
-}
-
-static void run_f00d_test(const char* klicensee_hex, const char* cache_path)
-{
-    uint8_t in_key[16];
-    uint8_t out_key[16];
-    f00d_context ctx;
-    npdrm_status st;
-
-    if (parse_hex_16(klicensee_hex, in_key) != 0)
-    {
-        sys_error("ERROR: --f00d-test expects 32 hex chars (16 bytes)\n");
-    }
-
-    ctx.cache_path = cache_path;
-    st = f00d_derive_key(&ctx, in_key, sizeof(in_key), out_key, sizeof(out_key));
-    if (st != NPDRM_OK)
-    {
-        sys_error("ERROR: f00d derive failed (status %d). Provide --f00d-cache or known vector.\n", (int)st);
-    }
-
-    sys_output("klicensee: ");
-    print_hex_16(in_key);
-    sys_output("derived:   ");
-    print_hex_16(out_key);
-}
-
-static char* load_text_file_compact(const char* path)
-{
-    FILE* f;
-    long size;
-    long i;
-    long j;
-    char* raw;
-    char* compact;
-
-    f = fopen(path, "rb");
-    if (f == NULL)
-    {
-        sys_error("ERROR: failed to open zRIF file '%s'\n", path);
-    }
-
-    if (fseek(f, 0, SEEK_END) != 0)
-    {
-        fclose(f);
-        sys_error("ERROR: failed to seek zRIF file '%s'\n", path);
-    }
-
-    size = ftell(f);
-    if (size < 0)
-    {
-        fclose(f);
-        sys_error("ERROR: failed to get zRIF file size '%s'\n", path);
-    }
-
-    if (fseek(f, 0, SEEK_SET) != 0)
-    {
-        fclose(f);
-        sys_error("ERROR: failed to rewind zRIF file '%s'\n", path);
-    }
-
-    raw = (char*)malloc((size_t)size + 1);
-    if (raw == NULL)
-    {
-        fclose(f);
-        sys_error("ERROR: out of memory reading zRIF file\n");
-    }
-
-    if (size > 0)
-    {
-        if (fread(raw, 1, (size_t)size, f) != (size_t)size)
-        {
-            fclose(f);
-            free(raw);
-            sys_error("ERROR: failed to read zRIF file '%s'\n", path);
-        }
-    }
-    fclose(f);
-
-    raw[size] = 0;
-
-    compact = (char*)malloc((size_t)size + 1);
-    if (compact == NULL)
-    {
-        free(raw);
-        sys_error("ERROR: out of memory processing zRIF file\n");
-    }
-
-    for (i = 0, j = 0; i < size; i++)
-    {
-        unsigned char c = (unsigned char)raw[i];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
-        {
-            continue;
-        }
-        compact[j++] = (char)c;
-    }
-    compact[j] = 0;
-
-    free(raw);
-    return compact;
-}
-
-static void run_zrif_test(const char* zrif_text, const char* zrif_file, const char* workbin_out, int derive_f00d, const char* f00d_cache)
-{
-    const char* input = zrif_text;
-    char* input_owned = NULL;
-    const uint32_t rif_size = 512;
-    uint8_t rif[512];
-    uint8_t klicensee[16];
-    npdrm_request req;
-    npdrm_status st;
-    npdrm_status f00d_st;
-    char err[256];
-    uint8_t derived_key[16];
-    f00d_context fctx;
-
-    if (input == NULL)
-    {
-        input_owned = load_text_file_compact(zrif_file);
-        input = input_owned;
-    }
-
-    if (input == NULL || input[0] == 0)
-    {
-        free(input_owned);
-        sys_error("ERROR: empty zRIF input\n");
-    }
-
-    zrif_decode(input, rif, rif_size);
-
-    memset(&req, 0, sizeof(req));
-    req.rif = rif;
-    req.rif_size = rif_size;
-
-    st = npdrm_resolve_klicensee(&req, klicensee, err, sizeof(err));
-
-    sys_output("zRIF decode: ok\n");
-    sys_output("work.bin size: %u\n", rif_size);
-    sys_output("content id: %.*s\n", 0x30, (const char*)rif + 0x10);
-
-    if (st == NPDRM_OK)
-    {
-        sys_output("klicensee: ");
-        print_hex_16(klicensee);
-
-        if (derive_f00d)
-        {
-            fctx.cache_path = f00d_cache;
-            f00d_st = f00d_derive_key(&fctx, klicensee, sizeof(klicensee), derived_key, sizeof(derived_key));
-            if (f00d_st == NPDRM_OK)
-            {
-                sys_output("derived:   ");
-                print_hex_16(derived_key);
-            }
-            else
-            {
-                sys_output("derived:   <unavailable> (status %d)\n", (int)f00d_st);
-            }
-        }
-    }
-    else
-    {
-        sys_output("klicensee: <unavailable> (%s)\n", err[0] ? err : "unknown error");
-    }
-
-    if (workbin_out != NULL)
-    {
-        FILE* out = fopen(workbin_out, "wb");
-        if (out == NULL)
-        {
-            free(input_owned);
-            sys_error("ERROR: failed to create '%s'\n", workbin_out);
-        }
-
-        if (fwrite(rif, 1, rif_size, out) != rif_size)
-        {
-            fclose(out);
-            free(input_owned);
-            sys_error("ERROR: failed to write '%s'\n", workbin_out);
-        }
-
-        fclose(out);
-        sys_output("wrote: %s\n", workbin_out);
-    }
-
-    free(input_owned);
-}
 
 // http://vitadevwiki.com/vita/System_File_Object_(SFO)_(PSF)#Internal_Structure
 // https://github.com/TheOfficialFloW/VitaShell/blob/1.74/sfo.h#L29
@@ -626,12 +384,7 @@ void print_help(char* bin_name)
     sys_output("-b|--no-bgdl       Disable bgdl output for VITA Theme extraction\n");
     sys_output("-q|--quiet         Do not output anything to stdout\n");
     sys_output("-h|--help          Shows this help message\n");
-    sys_output("--f00d-test HEX    Derive and print key from 16-byte HEX klicensee\n");
-    sys_output("--f00d-cache FILE  Optional mapping file used by --f00d-test\n");
-    sys_output("--zrif-test STR    Decode zRIF string and print parsed fields\n");
-    sys_output("--zrif-file FILE   Read zRIF string from text file\n");
-    sys_output("--workbin-out FILE Write decoded zRIF as 512-byte work.bin\n");
-    sys_output("--derive-f00d      Also derive and print f00d key from extracted klicensee\n");
+    sys_output("-n|--npdrm         After Vita extraction, also emit a NPDRM-removed title tree (requires positional zRIF)\n");
     sys_output("\n");
     sys_output("PSP/PSX only options:\n");
     sys_output("-c[NUM]            Create a *.CSO file instead of ISO. [NUM] is the compression ratio\n");
@@ -640,7 +393,7 @@ void print_help(char* bin_name)
     sys_output("PSM only options:\n");
 	sys_output("-a|--android-psm   Extract into PSM for Android format.\n");
     sys_output("\n");
-    sys_output("Usage: %s [-x] [-c[N]] [-b] [-p] <file.pkg> [zRIF]\n", bin_name);
+    sys_output("Usage: %s [-x] [-n] [-c[N]] [-b] [-p] <file.pkg> [zRIF]\n", bin_name);
 }
 
 typedef enum {
@@ -666,13 +419,8 @@ int main(int argc, char* argv[])
     int pbp = 0;
     int ddlc = 0;
     int bgdl = 1;
+    int npdrm_decrypt = 0;
 	int android = 0;
-    const char* f00d_test_arg = NULL;
-    const char* f00d_cache_arg = NULL;
-    const char* zrif_test_arg = NULL;
-    const char* zrif_file_arg = NULL;
-    const char* workbin_out_arg = NULL;
-    int derive_f00d = 0;
     const char* pkg_arg = NULL;
     const char* zrif_arg = NULL;
     for (int i = 1; i < argc; i++)
@@ -721,49 +469,9 @@ int main(int argc, char* argv[])
             print_help(argv[0]);
             exit(0);
         }
-        else if (strcmp(argv[i], "--f00d-test") == 0)
+        else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--npdrm") == 0)
         {
-            if (i + 1 >= argc)
-            {
-                sys_error("ERROR: --f00d-test requires a 32-char hex argument\n");
-            }
-            f00d_test_arg = argv[++i];
-        }
-        else if (strcmp(argv[i], "--f00d-cache") == 0)
-        {
-            if (i + 1 >= argc)
-            {
-                sys_error("ERROR: --f00d-cache requires a file path\n");
-            }
-            f00d_cache_arg = argv[++i];
-        }
-        else if (strcmp(argv[i], "--zrif-test") == 0)
-        {
-            if (i + 1 >= argc)
-            {
-                sys_error("ERROR: --zrif-test requires a zRIF string\n");
-            }
-            zrif_test_arg = argv[++i];
-        }
-        else if (strcmp(argv[i], "--zrif-file") == 0)
-        {
-            if (i + 1 >= argc)
-            {
-                sys_error("ERROR: --zrif-file requires a file path\n");
-            }
-            zrif_file_arg = argv[++i];
-        }
-        else if (strcmp(argv[i], "--workbin-out") == 0)
-        {
-            if (i + 1 >= argc)
-            {
-                sys_error("ERROR: --workbin-out requires a file path\n");
-            }
-            workbin_out_arg = argv[++i];
-        }
-        else if (strcmp(argv[i], "--derive-f00d") == 0)
-        {
-            derive_f00d = 1;
+            npdrm_decrypt = 1;
         }
         else
         {
@@ -782,27 +490,21 @@ int main(int argc, char* argv[])
         }
     }
 
-    if (f00d_test_arg != NULL)
-    {
-        run_f00d_test(f00d_test_arg, f00d_cache_arg);
-        exit(0);
-    }
-
-    if (zrif_test_arg != NULL || zrif_file_arg != NULL)
-    {
-        if (zrif_test_arg != NULL && zrif_file_arg != NULL)
-        {
-            sys_error("ERROR: use either --zrif-test or --zrif-file, not both\n");
-        }
-        run_zrif_test(zrif_test_arg, zrif_file_arg, workbin_out_arg, derive_f00d, f00d_cache_arg);
-        exit(0);
-    }
-
     if (pkg_arg == NULL)
     {
         fprintf(stderr, "ERROR: no pkg file specified\n");
         print_help(argv[0]);
         exit(1);
+    }
+
+    if (npdrm_decrypt && zipped)
+    {
+        sys_error("ERROR: -n|--npdrm currently requires --extract so pkg2zip has a real title directory to decrypt\n");
+    }
+
+    if (npdrm_decrypt && zrif_arg == NULL)
+    {
+        sys_error("ERROR: -n|--npdrm requires a positional zRIF argument\n");
     }
 
     if (verbose)
@@ -1171,24 +873,42 @@ int main(int argc, char* argv[])
             sys_output("[*] unpacking '%s' to directory\n", root);
     }
 
+    char output_name[1024];
+    char extraction_root_prefix[1024] = {0};
+    char npdrm_title_relpath[1024] = {0};
+    char npdrm_title_srcpath[1024] = {0};
+    snprintf(output_name, sizeof(output_name), "%s", root);
+
+    if (npdrm_decrypt)
+    {
+        snprintf(extraction_root_prefix, sizeof(extraction_root_prefix), "%s [npdrm-stage]", output_name);
+        sys_remove_tree(extraction_root_prefix);
+    }
+
     out_begin(root, zipped);
     root[0] = 0;
 
+    if (extraction_root_prefix[0] != 0)
+    {
+        sys_vstrncat(root, sizeof(root), "%s", extraction_root_prefix);
+        out_add_folder(root);
+    }
+
     if (type == PKG_TYPE_PSP)
     {
-        snprintf(root, sizeof(root), "pspemu/PSP/GAME/%.9s", id);
+        sys_vstrncat(root, sizeof(root), "%spspemu/PSP/GAME/%.9s", root[0] != 0 ? "/" : "", id);
     }
     else if (type == PKG_TYPE_PSP_THEME)
     {
-        snprintf(root, sizeof(root), "pspemu/PSP/THEME");
+        sys_vstrncat(root, sizeof(root), "%spspemu/PSP/THEME", root[0] != 0 ? "/" : "");
     }
     else if (type == PKG_TYPE_PSX)
     {
-        snprintf(root, sizeof(root), "pspemu/PSP/GAME/%.9s", id);
+        sys_vstrncat(root, sizeof(root), "%spspemu/PSP/GAME/%.9s", root[0] != 0 ? "/" : "", id);
     }
     else if (type == PKG_TYPE_VITA_DLC)
     {
-        sys_vstrncat(root, sizeof(root), "addcont");
+        sys_vstrncat(root, sizeof(root), "%saddcont", root[0] != 0 ? "/" : "");
         out_add_folder(root);
 
         sys_vstrncat(root, sizeof(root), "/%.9s", id);
@@ -1199,7 +919,7 @@ int main(int argc, char* argv[])
     }
     else if (type == PKG_TYPE_VITA_PATCH)
     {
-        sys_vstrncat(root, sizeof(root), "patch");
+        sys_vstrncat(root, sizeof(root), "%spatch", root[0] != 0 ? "/" : "");
         out_add_folder(root);
 
         sys_vstrncat(root, sizeof(root), "/%.9s", id);
@@ -1207,7 +927,7 @@ int main(int argc, char* argv[])
     }
     else if (type == PKG_TYPE_VITA_PSM)
     {
-        sys_vstrncat(root, sizeof(root), "psm");
+        sys_vstrncat(root, sizeof(root), "%spsm", root[0] != 0 ? "/" : "");
         out_add_folder(root);
 
         sys_vstrncat(root, sizeof(root), "/%.9s", id);
@@ -1215,7 +935,7 @@ int main(int argc, char* argv[])
     }
     else if (type == PKG_TYPE_VITA_APP)
     {
-        sys_vstrncat(root, sizeof(root), "app");
+        sys_vstrncat(root, sizeof(root), "%sapp", root[0] != 0 ? "/" : "");
         out_add_folder(root);
 
         sys_vstrncat(root, sizeof(root), "/%.9s", id);
@@ -1226,7 +946,7 @@ int main(int argc, char* argv[])
 
         if (bgdl == 1)
         {
-            sys_vstrncat(root, sizeof(root), "bgdl/t");
+            sys_vstrncat(root, sizeof(root), "%sbgdl/t", root[0] != 0 ? "/" : "");
             out_add_folder(root);
 
             uint32_t bgdl_task = 0;
@@ -1250,7 +970,7 @@ int main(int argc, char* argv[])
         }
         else 
         {
-            sys_vstrncat(root, sizeof(root), "app");
+            sys_vstrncat(root, sizeof(root), "%sapp", root[0] != 0 ? "/" : "");
             out_add_folder(root);
         }
 
@@ -1259,12 +979,25 @@ int main(int argc, char* argv[])
     }
     else if (type == PKG_TYPE_PS3)
     {
-        snprintf(root, sizeof(root), "pspemu/PSP/GAME");
+        sys_vstrncat(root, sizeof(root), "%spspemu/PSP/GAME", root[0] != 0 ? "/" : "");
     }
     else
     {
         assert(0);
         sys_error("ERROR: unsupported type %i\n", type);
+    }
+
+    if (type == PKG_TYPE_VITA_APP || type == PKG_TYPE_VITA_DLC || type == PKG_TYPE_VITA_THEME || type == PKG_TYPE_VITA_PATCH)
+    {
+        snprintf(npdrm_title_srcpath, sizeof(npdrm_title_srcpath), "%s", root);
+        if (extraction_root_prefix[0] != 0 && strncmp(root, extraction_root_prefix, strlen(extraction_root_prefix)) == 0 && root[strlen(extraction_root_prefix)] == '/')
+        {
+            snprintf(npdrm_title_relpath, sizeof(npdrm_title_relpath), "%s", root + strlen(extraction_root_prefix) + 1);
+        }
+        else
+        {
+            snprintf(npdrm_title_relpath, sizeof(npdrm_title_relpath), "%s", root);
+        }
     }
 
     char path[1024];
@@ -1748,6 +1481,48 @@ int main(int argc, char* argv[])
     }
 
     out_end();
+
+    if (npdrm_decrypt)
+    {
+        npdrm_request np_req;
+        npdrm_result np_result;
+        char np_title_src_dir[1024];
+        char np_title_dst_dir[1024];
+        char np_output_name[1024];
+
+        if (!(type == PKG_TYPE_VITA_APP || type == PKG_TYPE_VITA_DLC || type == PKG_TYPE_VITA_THEME || type == PKG_TYPE_VITA_PATCH))
+        {
+            sys_error("ERROR: -n|--npdrm currently supports Vita APP, PATCH, DLC, and Theme packages only\n");
+        }
+        if (npdrm_title_relpath[0] == 0)
+        {
+            sys_error("ERROR: internal error: missing extracted Vita title path for -n|--npdrm\n");
+        }
+
+        snprintf(np_output_name, sizeof(np_output_name), "%s [npdrm-removed]", output_name);
+        snprintf(np_title_src_dir, sizeof(np_title_src_dir), "%s", npdrm_title_srcpath);
+        snprintf(np_title_dst_dir, sizeof(np_title_dst_dir), "%s/%s", np_output_name, npdrm_title_relpath);
+
+        memset(&np_req, 0, sizeof(np_req));
+        np_req.title_src_dir = np_title_src_dir;
+        np_req.title_dst_dir = np_title_dst_dir;
+        np_req.zrif = zrif_arg;
+
+        if (verbose)
+        {
+            sys_output("[*] decrypting Vita NPDRM title to '%s'\n", np_output_name);
+        }
+        np_result = npdrm_extract_title(&np_req);
+        if (np_result.status != NPDRM_OK)
+        {
+            sys_error("ERROR: Vita NPDRM decryption failed: %s\n", np_result.error_message[0] ? np_result.error_message : "unknown error");
+        }
+
+        if (extraction_root_prefix[0] != 0)
+        {
+            sys_remove_tree(extraction_root_prefix);
+        }
+    }
 
     if (verbose)
     {

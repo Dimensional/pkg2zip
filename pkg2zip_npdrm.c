@@ -196,10 +196,7 @@ npdrm_result npdrm_extract_title(const npdrm_request* request)
 
     // Placeholder for F00D-like transformation stage.
     uint8_t content_key[16];
-    f00d_context fctx;
-    fctx.cache_path = request->f00d_cache_path;
-
-    result.status = f00d_derive_key(&fctx, klicensee, sizeof(klicensee), content_key, sizeof(content_key));
+    result.status = f00d_derive_key(klicensee, sizeof(klicensee), content_key, sizeof(content_key));
     if (result.status != NPDRM_OK)
     {
         set_error(result.error_message, sizeof(result.error_message), "F00D-like key derivation not implemented yet");

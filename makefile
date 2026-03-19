@@ -1,5 +1,5 @@
 ifeq ($(OS),Windows_NT)
-  RM := del /q
+#  RM := del /q
   EXE := .exe
 else
   EXE :=

@@ -29,3 +29,4 @@ void* sys_realloc(void* ptr, size_t size);
 void sys_vstrncat(char* dst, size_t n, const char* format, ...);
 
 int sys_test_dir(const char* const path);
+void sys_remove_tree(const char* path);
