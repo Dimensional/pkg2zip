@@ -97,19 +97,6 @@ To generate work.bin from zRIF string use `zrif2rif.py` script:
 
 Last argument is optional, it specifies where to save file and defaults to work.bin name.
 
-# Download
-
-Get latest Windows binaries [here][downloads].
-
-ArchLinux users can build binary with [pkg2zip][AUR] package in AUR repository. For example, with pacaur:
-
-    $ pacaur -S pkg2zip
-
-openSUSE users can download the package from the [Packman](http://packman.links2linux.de/package/pkg2zip) repository.
-If this repository is enabled, just install pkg2zip with zypper.
-
-    # zypper install pkg2zip
-
 # Building
 
 Execute `make` if you are on GNU/Linux or macOS (gcc comiler required)
