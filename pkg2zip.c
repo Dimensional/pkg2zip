@@ -5,6 +5,7 @@
 #include "pkg2zip_utils.h"
 #include "pkg2zip_zrif.h"
 #include "pkg2zip_npdrm.h"
+#include "pkg2zip_pfs.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -384,7 +385,7 @@ void print_help(char* bin_name)
     sys_output("-b|--no-bgdl       Disable bgdl output for VITA Theme extraction\n");
     sys_output("-q|--quiet         Do not output anything to stdout\n");
     sys_output("-h|--help          Shows this help message\n");
-    sys_output("-n|--npdrm         After Vita extraction, also emit a NPDRM-removed title tree (requires positional zRIF)\n");
+    sys_output("-n|--npdrm         Decrypt Vita APP/DLC/PATCH/Theme content straight from the pkg into a NPDRM-removed title tree (requires positional zRIF)\n");
     sys_output("\n");
     sys_output("PSP/PSX only options:\n");
     sys_output("-c[NUM]            Create a *.CSO file instead of ISO. [NUM] is the compression ratio\n");
@@ -495,11 +496,6 @@ int main(int argc, char* argv[])
         fprintf(stderr, "ERROR: no pkg file specified\n");
         print_help(argv[0]);
         exit(1);
-    }
-
-    if (npdrm_decrypt && zipped)
-    {
-        sys_error("ERROR: -n|--npdrm currently requires --extract so pkg2zip has a real title directory to decrypt\n");
     }
 
     if (npdrm_decrypt && zrif_arg == NULL)
@@ -765,6 +761,11 @@ int main(int argc, char* argv[])
         }
     }
 
+    if (npdrm_decrypt && !(type == PKG_TYPE_VITA_APP || type == PKG_TYPE_VITA_DLC || type == PKG_TYPE_VITA_THEME || type == PKG_TYPE_VITA_PATCH))
+    {
+        sys_error("ERROR: -n|--npdrm currently supports Vita APP, PATCH, DLC, and Theme packages only\n");
+    }
+
     const char* ext = zipped ? ".zip" : "";
 
     char root[1024];
@@ -874,25 +875,16 @@ int main(int argc, char* argv[])
     }
 
     char output_name[1024];
-    char extraction_root_prefix[1024] = {0};
     char npdrm_title_relpath[1024] = {0};
-    char npdrm_title_srcpath[1024] = {0};
     snprintf(output_name, sizeof(output_name), "%s", root);
 
-    if (npdrm_decrypt)
+    // -n|--npdrm decrypts straight from the .pkg into the final title tree (see below), so the
+    // normal out_* container/extraction never runs -- nothing here needs a throwaway disk copy.
+    if (!npdrm_decrypt)
     {
-        snprintf(extraction_root_prefix, sizeof(extraction_root_prefix), "%s [npdrm-stage]", output_name);
-        sys_remove_tree(extraction_root_prefix);
+        out_begin(root, zipped);
     }
-
-    out_begin(root, zipped);
     root[0] = 0;
-
-    if (extraction_root_prefix[0] != 0)
-    {
-        sys_vstrncat(root, sizeof(root), "%s", extraction_root_prefix);
-        out_add_folder(root);
-    }
 
     if (type == PKG_TYPE_PSP)
     {
@@ -909,37 +901,37 @@ int main(int argc, char* argv[])
     else if (type == PKG_TYPE_VITA_DLC)
     {
         sys_vstrncat(root, sizeof(root), "%saddcont", root[0] != 0 ? "/" : "");
-        out_add_folder(root);
+        if (!npdrm_decrypt) out_add_folder(root);
 
         sys_vstrncat(root, sizeof(root), "/%.9s", id);
-        out_add_folder(root);
+        if (!npdrm_decrypt) out_add_folder(root);
 
         sys_vstrncat(root, sizeof(root), "/%s", id2);
-        out_add_folder(root);
+        if (!npdrm_decrypt) out_add_folder(root);
     }
     else if (type == PKG_TYPE_VITA_PATCH)
     {
         sys_vstrncat(root, sizeof(root), "%spatch", root[0] != 0 ? "/" : "");
-        out_add_folder(root);
+        if (!npdrm_decrypt) out_add_folder(root);
 
         sys_vstrncat(root, sizeof(root), "/%.9s", id);
-        out_add_folder(root);
+        if (!npdrm_decrypt) out_add_folder(root);
     }
     else if (type == PKG_TYPE_VITA_PSM)
     {
         sys_vstrncat(root, sizeof(root), "%spsm", root[0] != 0 ? "/" : "");
-        out_add_folder(root);
+        if (!npdrm_decrypt) out_add_folder(root);
 
         sys_vstrncat(root, sizeof(root), "/%.9s", id);
-        out_add_folder(root);
+        if (!npdrm_decrypt) out_add_folder(root);
     }
     else if (type == PKG_TYPE_VITA_APP)
     {
         sys_vstrncat(root, sizeof(root), "%sapp", root[0] != 0 ? "/" : "");
-        out_add_folder(root);
+        if (!npdrm_decrypt) out_add_folder(root);
 
         sys_vstrncat(root, sizeof(root), "/%.9s", id);
-        out_add_folder(root);
+        if (!npdrm_decrypt) out_add_folder(root);
     }
     else if (type == PKG_TYPE_VITA_THEME)
     {
@@ -947,17 +939,17 @@ int main(int argc, char* argv[])
         if (bgdl == 1)
         {
             sys_vstrncat(root, sizeof(root), "%sbgdl/t", root[0] != 0 ? "/" : "");
-            out_add_folder(root);
+            if (!npdrm_decrypt) out_add_folder(root);
 
             uint32_t bgdl_task = 0;
             char dir[1024] = {0};
             if(zipped == 0)
             {
-                do 
+                do
                 {
                     bgdl_task++;
                     snprintf(dir, sizeof(dir), "%s/%08x",root, bgdl_task);
-                } 
+                }
                 while (sys_test_dir(dir));
             }
             else
@@ -966,16 +958,16 @@ int main(int argc, char* argv[])
             }
 
             sys_vstrncat(root,sizeof(root), "/%08x", bgdl_task);
-            out_add_folder(root);
+            if (!npdrm_decrypt) out_add_folder(root);
         }
-        else 
+        else
         {
             sys_vstrncat(root, sizeof(root), "%sapp", root[0] != 0 ? "/" : "");
-            out_add_folder(root);
+            if (!npdrm_decrypt) out_add_folder(root);
         }
 
         sys_vstrncat(root, sizeof(root), "/%.9s", id);
-        out_add_folder(root);
+        if (!npdrm_decrypt) out_add_folder(root);
     }
     else if (type == PKG_TYPE_PS3)
     {
@@ -989,15 +981,8 @@ int main(int argc, char* argv[])
 
     if (type == PKG_TYPE_VITA_APP || type == PKG_TYPE_VITA_DLC || type == PKG_TYPE_VITA_THEME || type == PKG_TYPE_VITA_PATCH)
     {
-        snprintf(npdrm_title_srcpath, sizeof(npdrm_title_srcpath), "%s", root);
-        if (extraction_root_prefix[0] != 0 && strncmp(root, extraction_root_prefix, strlen(extraction_root_prefix)) == 0 && root[strlen(extraction_root_prefix)] == '/')
-        {
-            snprintf(npdrm_title_relpath, sizeof(npdrm_title_relpath), "%s", root + strlen(extraction_root_prefix) + 1);
-        }
-        else
-        {
-            snprintf(npdrm_title_relpath, sizeof(npdrm_title_relpath), "%s", root);
-        }
+        // root is never staged under a prefix in npdrm mode, so it already is the relative path.
+        snprintf(npdrm_title_relpath, sizeof(npdrm_title_relpath), "%s", root);
     }
 
     char path[1024];
@@ -1015,8 +1000,11 @@ int main(int argc, char* argv[])
 		else {
 			snprintf(rw_folder, sizeof(rw_folder) - 1, "%s/RW", root);
 			snprintf(ro_folder, sizeof(ro_folder) - 1, "%s/RO", root);
-		}			
+		}
 	}
+
+    pfs_pkg_item* npdrm_items = NULL;
+    uint32_t npdrm_item_count = 0;
 
     for (uint32_t item_index = 0; item_index < item_count; item_index++)
     {
@@ -1061,11 +1049,18 @@ int main(int argc, char* argv[])
         aes128_ctr_xor(item_key, iv, name_offset / 16, (uint8_t*)name, name_size);
         name[name_size] = 0;
 
-        // sys_output("[%u/%u] %s\n", item_index + 1, item_count, name);
+        sys_output("[%u/%u] %s\n", item_index + 1, item_count, name);
 
 		
         if (flags == 4 || flags == 18) // Directory
         {
+            if (npdrm_decrypt)
+            {
+                // files.db (read directly from the .pkg below) already carries the full
+                // directory structure for the PFS pass; nothing to do here.
+                continue;
+            }
+
             if (type == PKG_TYPE_VITA_PSM)
             {
                 // skip "content/" prefix
@@ -1092,6 +1087,18 @@ int main(int argc, char* argv[])
         }
         else // File
         {
+            if (npdrm_decrypt)
+            {
+                // Just remember where this still-PKG-layer-encrypted item lives in the .pkg;
+                // the PFS pass below reads/decrypts it straight from there -- no throwaway write.
+                npdrm_items = (pfs_pkg_item*)sys_realloc(npdrm_items, sizeof(pfs_pkg_item) * (size_t)(npdrm_item_count + 1));
+                snprintf(npdrm_items[npdrm_item_count].name, sizeof(npdrm_items[npdrm_item_count].name), "%s", name);
+                npdrm_items[npdrm_item_count].data_offset = data_offset;
+                npdrm_items[npdrm_item_count].data_size = data_size;
+                npdrm_item_count++;
+                continue;
+            }
+
             int decrypt = 1;
             if ((type == PKG_TYPE_VITA_APP || type == PKG_TYPE_VITA_DLC || type == PKG_TYPE_VITA_PATCH || type == PKG_TYPE_VITA_THEME) && (strcmp("sce_sys/package/digs.bin", name) == 0 || strcmp("sce_sys/package/cert.bin", name) == 0 ))
             {
@@ -1267,6 +1274,10 @@ int main(int argc, char* argv[])
             sys_output("[*] unpacking completed\n");
     }
 
+    // None of the sce_sys/package/*, work.bin, theme pdb, or PSM System scaffolding below is ever
+    // read by the npdrm PFS pass, so skip writing it entirely when decrypting straight from the .pkg.
+    if (!npdrm_decrypt)
+    {
     if (type == PKG_TYPE_VITA_APP || type == PKG_TYPE_VITA_DLC || type == PKG_TYPE_VITA_PATCH || type == PKG_TYPE_VITA_THEME)
     {
         if (verbose)
@@ -1481,30 +1492,35 @@ int main(int argc, char* argv[])
     }
 
     out_end();
+    }
 
     if (npdrm_decrypt)
     {
         npdrm_request np_req;
         npdrm_result np_result;
-        char np_title_src_dir[1024];
+        pfs_source source;
+        pfs_pkg_source_ctx source_ctx;
         char np_title_dst_dir[1024];
         char np_output_name[1024];
 
-        if (!(type == PKG_TYPE_VITA_APP || type == PKG_TYPE_VITA_DLC || type == PKG_TYPE_VITA_THEME || type == PKG_TYPE_VITA_PATCH))
-        {
-            sys_error("ERROR: -n|--npdrm currently supports Vita APP, PATCH, DLC, and Theme packages only\n");
-        }
         if (npdrm_title_relpath[0] == 0)
         {
             sys_error("ERROR: internal error: missing extracted Vita title path for -n|--npdrm\n");
         }
 
         snprintf(np_output_name, sizeof(np_output_name), "%s [npdrm-removed]", output_name);
-        snprintf(np_title_src_dir, sizeof(np_title_src_dir), "%s", npdrm_title_srcpath);
         snprintf(np_title_dst_dir, sizeof(np_title_dst_dir), "%s/%s", np_output_name, npdrm_title_relpath);
 
+        source_ctx.pkg = pkg;
+        source_ctx.enc_offset = enc_offset;
+        source_ctx.item_key = &key;
+        source_ctx.iv = iv;
+        source_ctx.items = npdrm_items;
+        source_ctx.item_count = npdrm_item_count;
+        pfs_source_init_pkg(&source, &source_ctx);
+
         memset(&np_req, 0, sizeof(np_req));
-        np_req.title_src_dir = np_title_src_dir;
+        np_req.source = &source;
         np_req.title_dst_dir = np_title_dst_dir;
         np_req.zrif = zrif_arg;
 
@@ -1517,11 +1533,11 @@ int main(int argc, char* argv[])
         {
             sys_error("ERROR: Vita NPDRM decryption failed: %s\n", np_result.error_message[0] ? np_result.error_message : "unknown error");
         }
+    }
 
-        if (extraction_root_prefix[0] != 0)
-        {
-            sys_remove_tree(extraction_root_prefix);
-        }
+    if (npdrm_items != NULL)
+    {
+        sys_realloc(npdrm_items, 0);
     }
 
     if (verbose)

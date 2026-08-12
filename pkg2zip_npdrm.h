@@ -12,8 +12,10 @@ typedef enum {
     NPDRM_ERR_INTERNAL = -5,
 } npdrm_status;
 
+struct pfs_source; // see pkg2zip_pfs.h
+
 typedef struct {
-    const char* title_src_dir;
+    const struct pfs_source* source; // still-PKG-layer-encrypted title content, read directly from the .pkg
     const char* title_dst_dir;
     const char* zrif;
     const uint8_t* rif;

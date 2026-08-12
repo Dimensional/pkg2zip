@@ -180,10 +180,10 @@ npdrm_result npdrm_extract_title(const npdrm_request* request)
         return result;
     }
 
-    if (request->title_src_dir == NULL || request->title_dst_dir == NULL)
+    if (request->source == NULL || request->title_dst_dir == NULL)
     {
         result.status = NPDRM_ERR_INVALID_ARG;
-        set_error(result.error_message, sizeof(result.error_message), "title_src_dir and title_dst_dir are required");
+        set_error(result.error_message, sizeof(result.error_message), "source and title_dst_dir are required");
         return result;
     }
 
@@ -205,7 +205,7 @@ npdrm_result npdrm_extract_title(const npdrm_request* request)
 
     // Placeholder for PFS metadata + file decryption stage.
     pfs_request pfs_req;
-    pfs_req.title_src_dir = request->title_src_dir;
+    pfs_req.source = request->source;
     pfs_req.title_dst_dir = request->title_dst_dir;
     pfs_req.klicensee = klicensee;
     pfs_req.content_key = content_key;

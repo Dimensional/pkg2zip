@@ -7,7 +7,9 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
+
+#define FILES_DB_PATH "sce_pfs/files.db"
+#define UNICV_DB_PATH "sce_pfs/unicv.db"
 
 #define FILES_DB_MAGIC "SCENGPFS"
 
@@ -64,7 +66,6 @@ static uint32_t expected_sectors_for_size(uint32_t file_size, uint32_t sector_si
     return (file_size + sector_size - 1u) / sector_size;
 }
 
-static void join_path3(char* out, size_t out_size, const char* a, const char* b, const char* c);
 static void join_path2(char* out, size_t out_size, const char* a, const char* b);
 
 static void set_error(char* error_message, uint32_t error_message_size, const char* msg)
@@ -86,37 +87,59 @@ static void set_error(char* error_message, uint32_t error_message_size, const ch
     error_message[len] = 0;
 }
 
-static int path_exists_file(const char* path)
+static const pfs_pkg_item* pkg_source_find(const pfs_pkg_source_ctx* ctx, const char* path)
 {
-    struct stat info;
-    if (path == NULL)
+    uint32_t i;
+    if (ctx == NULL || path == NULL)
     {
-        return 0;
+        return NULL;
     }
-    if (stat(path, &info) != 0)
+    for (i = 0; i < ctx->item_count; i++)
     {
-        return 0;
+        if (strcmp(ctx->items[i].name, path) == 0)
+        {
+            return &ctx->items[i];
+        }
     }
-    return (info.st_mode & S_IFDIR) ? 0 : 1;
+    return NULL;
 }
 
-static uint64_t file_size_bytes(const char* path)
+static npdrm_status pkg_source_read(void* ctx_v, const char* path, uint64_t offset, uint32_t size, uint8_t* out, char* error_message, uint32_t error_message_size)
 {
-    struct stat info;
-    if (path == NULL)
+    pfs_pkg_source_ctx* ctx = (pfs_pkg_source_ctx*)ctx_v;
+    const pfs_pkg_item* item;
+    uint64_t rel_offset;
+
+    item = pkg_source_find(ctx, path);
+    if (item == NULL)
     {
-        return 0;
+        set_error(error_message, error_message_size, "path not found in pkg item table");
+        return NPDRM_ERR_INVALID_DATA;
     }
-    if (stat(path, &info) != 0)
+    if (offset > item->data_size || size > item->data_size - offset)
     {
-        return 0;
+        set_error(error_message, error_message_size, "read range exceeds pkg item size");
+        return NPDRM_ERR_INVALID_DATA;
     }
-    return (uint64_t)info.st_size;
+
+    rel_offset = item->data_offset + offset;
+    sys_read(ctx->pkg, ctx->enc_offset + rel_offset, out, size);
+    aes128_ctr_xor(ctx->item_key, ctx->iv, rel_offset / 16, out, size);
+    return NPDRM_OK;
 }
 
-static int path_exists_dir(const char* path)
+static uint64_t pkg_source_size_of(void* ctx_v, const char* path)
 {
-    return sys_test_dir(path) == 1;
+    pfs_pkg_source_ctx* ctx = (pfs_pkg_source_ctx*)ctx_v;
+    const pfs_pkg_item* item = pkg_source_find(ctx, path);
+    return item != NULL ? item->data_size : 0;
+}
+
+void pfs_source_init_pkg(pfs_source* out_source, pfs_pkg_source_ctx* ctx)
+{
+    out_source->read = pkg_source_read;
+    out_source->size_of = pkg_source_size_of;
+    out_source->ctx = ctx;
 }
 
 static void trim_name_copy(char out[69], const uint8_t* in68)
@@ -278,32 +301,34 @@ static npdrm_status create_empty_file_on_disk(const char* path)
     return NPDRM_OK;
 }
 
-static npdrm_status copy_file_raw(const char* src_path, const char* dst_path)
+static npdrm_status copy_source_file_raw(const pfs_source* source, const char* src_path, uint64_t src_size, const char* dst_path, char* error_message, uint32_t error_message_size)
 {
-    sys_file src;
     sys_file dst;
-    uint64_t src_size;
     uint64_t offset;
     uint8_t buffer[1 << 16];
+    npdrm_status st;
 
-    if (src_path == NULL || dst_path == NULL)
+    if (source == NULL || src_path == NULL || dst_path == NULL)
     {
         return NPDRM_ERR_INVALID_ARG;
     }
 
     ensure_parent_dir(dst_path);
-    src = sys_open(src_path, &src_size);
     dst = sys_create(dst_path);
 
     for (offset = 0; offset < src_size; offset += sizeof(buffer))
     {
         uint32_t chunk = (uint32_t)min64((uint64_t)sizeof(buffer), src_size - offset);
-        sys_read(src, offset, buffer, chunk);
+        st = source->read(source->ctx, src_path, offset, chunk, buffer, error_message, error_message_size);
+        if (st != NPDRM_OK)
+        {
+            sys_close(dst);
+            return st;
+        }
         sys_write(dst, offset, buffer, chunk);
     }
 
     sys_close(dst);
-    sys_close(src);
     return NPDRM_OK;
 }
 
@@ -367,25 +392,23 @@ static void build_unicv_tweak(const uint8_t tweak_mask[16], uint64_t tweak_key, 
     }
 }
 
-static npdrm_status decrypt_unicv_file_to_path(const char* src_path, const char* dst_path, uint32_t files_salt, uint32_t icv_salt, uint32_t sector_size, const uint8_t content_key[16], const uint8_t* dbseed, uint32_t dbseed_size)
+static npdrm_status decrypt_unicv_file_to_path(const pfs_source* source, const char* src_path, uint64_t file_size, const char* dst_path, uint32_t files_salt, uint32_t icv_salt, uint32_t sector_size, const uint8_t content_key[16], const uint8_t* dbseed, uint32_t dbseed_size, char* error_message, uint32_t error_message_size)
 {
-    sys_file src;
     sys_file dst;
-    uint64_t file_size;
     uint64_t offset;
     uint8_t tweak_mask[16];
     uint8_t tweak[16];
     uint8_t* buffer;
     aes128_key enc;
     aes128_key dec;
+    npdrm_status st;
 
-    if (src_path == NULL || dst_path == NULL || content_key == NULL || sector_size == 0u)
+    if (source == NULL || src_path == NULL || dst_path == NULL || content_key == NULL || sector_size == 0u)
     {
         return NPDRM_ERR_INVALID_ARG;
     }
 
     ensure_parent_dir(dst_path);
-    src = sys_open(src_path, &file_size);
     dst = sys_create(dst_path);
 
     if (dbseed != NULL && dbseed_size >= 20u)
@@ -404,14 +427,19 @@ static npdrm_status decrypt_unicv_file_to_path(const char* src_path, const char*
     {
         uint32_t chunk = (uint32_t)min64((uint64_t)sector_size, file_size - offset);
         build_unicv_tweak(tweak_mask, offset, tweak);
-        sys_read(src, offset, buffer, chunk);
+        st = source->read(source->ctx, src_path, offset, chunk, buffer, error_message, error_message_size);
+        if (st != NPDRM_OK)
+        {
+            sys_realloc(buffer, 0);
+            sys_close(dst);
+            return st;
+        }
         aes128_cbc_decrypt_cts(&dec, &enc, tweak, buffer, chunk, buffer);
         sys_write(dst, offset, buffer, chunk);
     }
 
     sys_realloc(buffer, 0);
     sys_close(dst);
-    sys_close(src);
     return NPDRM_OK;
 }
 
@@ -504,14 +532,14 @@ static void free_probe_candidates(pfs_probe_file_candidate* files, uint32_t coun
     sys_realloc(files, 0);
 }
 
-static npdrm_status collect_probe_candidates(const char* title_src_dir, const pfs_filesdb_inventory* inventory, const pfs_unicv_table_list* tables, pfs_probe_file_candidate** out_files, uint32_t* out_count, char* error_message, uint32_t error_message_size)
+static npdrm_status collect_probe_candidates(const pfs_source* source, const pfs_filesdb_inventory* inventory, const pfs_unicv_table_list* tables, pfs_probe_file_candidate** out_files, uint32_t* out_count, char* error_message, uint32_t error_message_size)
 {
     pfs_probe_file_candidate* files = NULL;
     uint32_t count = 0;
     uint32_t max_sector_size = 0;
     uint32_t i;
 
-    if (title_src_dir == NULL || inventory == NULL || tables == NULL || out_files == NULL || out_count == NULL)
+    if (source == NULL || inventory == NULL || tables == NULL || out_files == NULL || out_count == NULL)
     {
         set_error(error_message, error_message_size, "invalid probe candidate request");
         return NPDRM_ERR_INVALID_ARG;
@@ -535,22 +563,20 @@ static npdrm_status collect_probe_candidates(const char* title_src_dir, const pf
     for (i = 0; i < inventory->count; i++)
     {
         const pfs_filesdb_inventory_entry* entry = &inventory->entries[i];
-        char full_path[PFS_MAX_PATH];
         uint32_t read_size;
         uint64_t file_size;
-        uint64_t opened_size;
-        sys_file file;
+        npdrm_status st;
 
         if (!entry->is_processable || entry->size == 0 || entry->path[0] == 0)
         {
             continue;
         }
 
-        join_path2(full_path, sizeof(full_path), title_src_dir, entry->path);
-        if (full_path[0] == 0 || !path_exists_file(full_path))
+        file_size = source->size_of(source->ctx, entry->path);
+        if (file_size == 0)
         {
             free_probe_candidates(files, count);
-            set_error(error_message, error_message_size, "inventory file path not found on disk");
+            set_error(error_message, error_message_size, "inventory file path not found in pkg");
             return NPDRM_ERR_INVALID_DATA;
         }
 
@@ -558,7 +584,6 @@ static npdrm_status collect_probe_candidates(const char* title_src_dir, const pf
         memset(&files[count], 0, sizeof(files[count]));
         files[count].entry = entry;
 
-        file_size = file_size_bytes(full_path);
         read_size = (uint32_t)min64(file_size, max_sector_size);
         if (read_size == 0)
         {
@@ -569,16 +594,12 @@ static npdrm_status collect_probe_candidates(const char* title_src_dir, const pf
         files[count].first_bytes = (uint8_t*)sys_realloc(NULL, read_size);
         files[count].first_size = read_size;
 
-        file = sys_open(full_path, &opened_size);
-        if (opened_size < read_size)
+        st = source->read(source->ctx, entry->path, 0, read_size, files[count].first_bytes, error_message, error_message_size);
+        if (st != NPDRM_OK)
         {
-            sys_close(file);
             free_probe_candidates(files, count + 1);
-            set_error(error_message, error_message_size, "failed to read probe file sector");
-            return NPDRM_ERR_IO;
+            return st;
         }
-        sys_read(file, 0, files[count].first_bytes, read_size);
-        sys_close(file);
         count++;
     }
 
@@ -587,28 +608,30 @@ static npdrm_status collect_probe_candidates(const char* title_src_dir, const pf
     return NPDRM_OK;
 }
 
-npdrm_status pfs_read_filesdb_header(const char* files_db_path, pfs_filesdb_header* out_header, char* error_message, uint32_t error_message_size)
+npdrm_status pfs_read_filesdb_header(const pfs_source* source, pfs_filesdb_header* out_header, char* error_message, uint32_t error_message_size)
 {
-    sys_file files_db;
     uint64_t files_db_size;
     uint8_t header[0x38];
+    npdrm_status st;
 
-    if (files_db_path == NULL || out_header == NULL)
+    if (source == NULL || out_header == NULL)
     {
         set_error(error_message, error_message_size, "invalid files.db header request");
         return NPDRM_ERR_INVALID_ARG;
     }
 
-    files_db = sys_open(files_db_path, &files_db_size);
+    files_db_size = source->size_of(source->ctx, FILES_DB_PATH);
     if (files_db_size < sizeof(header))
     {
-        sys_close(files_db);
         set_error(error_message, error_message_size, "files.db is too small for header");
         return NPDRM_ERR_INVALID_DATA;
     }
 
-    sys_read(files_db, 0, header, (uint32_t)sizeof(header));
-    sys_close(files_db);
+    st = source->read(source->ctx, FILES_DB_PATH, 0, (uint32_t)sizeof(header), header, error_message, error_message_size);
+    if (st != NPDRM_OK)
+    {
+        return st;
+    }
 
     if (memcmp(header, FILES_DB_MAGIC, 8) != 0)
     {
@@ -636,20 +659,6 @@ npdrm_status pfs_read_filesdb_header(const char* files_db_path, pfs_filesdb_head
     }
 
     return NPDRM_OK;
-}
-
-static void join_path3(char* out, size_t out_size, const char* a, const char* b, const char* c)
-{
-    int n;
-    if (out == NULL || out_size == 0)
-    {
-        return;
-    }
-    n = snprintf(out, out_size, "%s/%s/%s", a, b, c);
-    if (n < 0 || (size_t)n >= out_size)
-    {
-        out[0] = 0;
-    }
 }
 
 static void join_path2(char* out, size_t out_size, const char* a, const char* b)
@@ -800,21 +809,21 @@ static npdrm_status build_dir_path_from_matrix(
     return NPDRM_OK;
 }
 
-npdrm_status pfs_collect_filesdb_inventory(const char* files_db_path, const pfs_filesdb_header* header, pfs_filesdb_inventory* out_inventory, char* error_message, uint32_t error_message_size)
+npdrm_status pfs_collect_filesdb_inventory(const pfs_source* source, const pfs_filesdb_header* header, pfs_filesdb_inventory* out_inventory, char* error_message, uint32_t error_message_size)
 {
-    sys_file files_db;
     uint64_t files_db_size;
     uint64_t tail_offset;
     uint64_t tail_size;
     uint64_t page_count;
     uint8_t page[FILES_DB_ENTRY_PAGE_SIZE];
     uint64_t p;
+    npdrm_status st;
     pfs_idx_edge* dir_edges = NULL;
     pfs_idx_edge* file_edges = NULL;
     uint32_t dir_edge_count = 0;
     uint32_t file_edge_count = 0;
 
-    if (files_db_path == NULL || header == NULL || out_inventory == NULL)
+    if (source == NULL || header == NULL || out_inventory == NULL)
     {
         set_error(error_message, error_message_size, "invalid files.db inventory request");
         return NPDRM_ERR_INVALID_ARG;
@@ -828,10 +837,9 @@ npdrm_status pfs_collect_filesdb_inventory(const char* files_db_path, const pfs_
         return NPDRM_ERR_NOT_IMPLEMENTED;
     }
 
-    files_db = sys_open(files_db_path, &files_db_size);
+    files_db_size = source->size_of(source->ctx, FILES_DB_PATH);
     if (files_db_size < header->page_size)
     {
-        sys_close(files_db);
         set_error(error_message, error_message_size, "files.db is too small");
         return NPDRM_ERR_INVALID_DATA;
     }
@@ -840,7 +848,6 @@ npdrm_status pfs_collect_filesdb_inventory(const char* files_db_path, const pfs_
     tail_size = files_db_size - tail_offset;
     if ((tail_size % header->page_size) != 0)
     {
-        sys_close(files_db);
         set_error(error_message, error_message_size, "files.db tail is not page aligned");
         return NPDRM_ERR_INVALID_DATA;
     }
@@ -852,12 +859,15 @@ npdrm_status pfs_collect_filesdb_inventory(const char* files_db_path, const pfs_
         uint32_t n_files;
         uint32_t i;
 
-        sys_read(files_db, tail_offset + (p * header->page_size), page, FILES_DB_ENTRY_PAGE_SIZE);
+        st = source->read(source->ctx, FILES_DB_PATH, tail_offset + (p * header->page_size), FILES_DB_ENTRY_PAGE_SIZE, page, error_message, error_message_size);
+        if (st != NPDRM_OK)
+        {
+            return st;
+        }
         n_files = get32le(page + 8);
         if (n_files > FILES_DB_MAX_FILES_IN_BLOCK)
         {
             pfs_free_filesdb_inventory(out_inventory);
-            sys_close(files_db);
             set_error(error_message, error_message_size, "files.db block has invalid file count");
             return NPDRM_ERR_INVALID_DATA;
         }
@@ -907,7 +917,6 @@ npdrm_status pfs_collect_filesdb_inventory(const char* files_db_path, const pfs_
                     {
                         sys_realloc(file_edges, 0);
                     }
-                    sys_close(files_db);
                     set_error(error_message, error_message_size, "duplicate directory index in files.db");
                     return NPDRM_ERR_INVALID_DATA;
                 }
@@ -943,7 +952,6 @@ npdrm_status pfs_collect_filesdb_inventory(const char* files_db_path, const pfs_
                 {
                     sys_realloc(file_edges, 0);
                 }
-                sys_close(files_db);
                 set_error(error_message, error_message_size, "duplicate file index in files.db");
                 return NPDRM_ERR_INVALID_DATA;
             }
@@ -957,8 +965,6 @@ npdrm_status pfs_collect_filesdb_inventory(const char* files_db_path, const pfs_
             out_inventory->processable_file_count++;
         }
     }
-
-    sys_close(files_db);
 
     // Build canonical paths for directories first.
     {
@@ -1102,9 +1108,8 @@ void pfs_free_filesdb_inventory(pfs_filesdb_inventory* inventory)
     inventory->fixed_unexisting_nonempty_count = 0;
 }
 
-npdrm_status pfs_collect_unicv_tables(const char* unicv_db_path, pfs_unicv_table_list* out_tables, char* error_message, uint32_t error_message_size)
+npdrm_status pfs_collect_unicv_tables(const pfs_source* source, pfs_unicv_table_list* out_tables, char* error_message, uint32_t error_message_size)
 {
-    sys_file unicv;
     uint64_t unicv_size;
     uint8_t header[UNICV_HEADER_SIZE];
     uint64_t data_offset;
@@ -1112,8 +1117,9 @@ npdrm_status pfs_collect_unicv_tables(const char* unicv_db_path, pfs_unicv_table
     uint32_t block_size;
     uint64_t block_count;
     uint64_t i;
+    npdrm_status st;
 
-    if (unicv_db_path == NULL || out_tables == NULL)
+    if (source == NULL || out_tables == NULL)
     {
         set_error(error_message, error_message_size, "invalid unicv parse request");
         return NPDRM_ERR_INVALID_ARG;
@@ -1121,18 +1127,20 @@ npdrm_status pfs_collect_unicv_tables(const char* unicv_db_path, pfs_unicv_table
 
     memset(out_tables, 0, sizeof(*out_tables));
 
-    unicv = sys_open(unicv_db_path, &unicv_size);
+    unicv_size = source->size_of(source->ctx, UNICV_DB_PATH);
     if (unicv_size < UNICV_HEADER_SIZE)
     {
-        sys_close(unicv);
         set_error(error_message, error_message_size, "unicv.db is too small");
         return NPDRM_ERR_INVALID_DATA;
     }
 
-    sys_read(unicv, 0, header, UNICV_HEADER_SIZE);
+    st = source->read(source->ctx, UNICV_DB_PATH, 0, UNICV_HEADER_SIZE, header, error_message, error_message_size);
+    if (st != NPDRM_OK)
+    {
+        return st;
+    }
     if (memcmp(header + 0, UNICV_DB_MAGIC, 8) != 0)
     {
-        sys_close(unicv);
         set_error(error_message, error_message_size, "unicv.db has invalid magic");
         return NPDRM_ERR_INVALID_DATA;
     }
@@ -1143,21 +1151,18 @@ npdrm_status pfs_collect_unicv_tables(const char* unicv_db_path, pfs_unicv_table
 
     if (block_size == 0)
     {
-        sys_close(unicv);
         set_error(error_message, error_message_size, "unicv.db has invalid block size");
         return NPDRM_ERR_INVALID_DATA;
     }
 
     if (data_offset + data_size > unicv_size)
     {
-        sys_close(unicv);
         set_error(error_message, error_message_size, "unicv.db data region out of bounds");
         return NPDRM_ERR_INVALID_DATA;
     }
 
     if ((data_size % block_size) != 0)
     {
-        sys_close(unicv);
         set_error(error_message, error_message_size, "unicv.db data region is not block aligned");
         return NPDRM_ERR_INVALID_DATA;
     }
@@ -1176,17 +1181,26 @@ npdrm_status pfs_collect_unicv_tables(const char* unicv_db_path, pfs_unicv_table
         uint32_t sig_blocks;
         pfs_unicv_table_info* t;
 
-        sys_read(unicv, block_offset, zero_probe, (uint32_t)sizeof(zero_probe));
+        st = source->read(source->ctx, UNICV_DB_PATH, block_offset, (uint32_t)sizeof(zero_probe), zero_probe, error_message, error_message_size);
+        if (st != NPDRM_OK)
+        {
+            pfs_free_unicv_table_list(out_tables);
+            return st;
+        }
         if (memcmp(zero_probe, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) == 0)
         {
             i++;
             continue;
         }
 
-        sys_read(unicv, block_offset, block_header, UNICV_TABLE_HEADER_SIZE);
+        st = source->read(source->ctx, UNICV_DB_PATH, block_offset, UNICV_TABLE_HEADER_SIZE, block_header, error_message, error_message_size);
+        if (st != NPDRM_OK)
+        {
+            pfs_free_unicv_table_list(out_tables);
+            return st;
+        }
         if (memcmp(block_header + 0, UNICV_TABLE_MAGIC, 8) != 0)
         {
-            sys_close(unicv);
             pfs_free_unicv_table_list(out_tables);
             set_error(error_message, error_message_size, "unexpected table magic in unicv.db");
             return NPDRM_ERR_INVALID_DATA;
@@ -1199,7 +1213,6 @@ npdrm_status pfs_collect_unicv_tables(const char* unicv_db_path, pfs_unicv_table
 
         if (bin_max == 0)
         {
-            sys_close(unicv);
             pfs_free_unicv_table_list(out_tables);
             set_error(error_message, error_message_size, "unicv.db table has invalid binTreeNumMaxAvail");
             return NPDRM_ERR_INVALID_DATA;
@@ -1230,37 +1243,42 @@ npdrm_status pfs_collect_unicv_tables(const char* unicv_db_path, pfs_unicv_table
 
             if (sig_blocks == 0 || sig_block_offset + 36u > unicv_size)
             {
-                sys_close(unicv);
                 pfs_free_unicv_table_list(out_tables);
                 set_error(error_message, error_message_size, "unicv.db table is missing first signature block");
                 return NPDRM_ERR_INVALID_DATA;
             }
 
-            sys_read(unicv, sig_block_offset, sig_header, sizeof(sig_header));
+            st = source->read(source->ctx, UNICV_DB_PATH, sig_block_offset, (uint32_t)sizeof(sig_header), sig_header, error_message, error_message_size);
+            if (st != NPDRM_OK)
+            {
+                pfs_free_unicv_table_list(out_tables);
+                return st;
+            }
             if (get32le(sig_header + 0) != (16u + (bin_max * 20u)) || get32le(sig_header + 4) != 20u || get32le(sig_header + 12) != 0u)
             {
-                sys_close(unicv);
                 pfs_free_unicv_table_list(out_tables);
                 set_error(error_message, error_message_size, "unicv.db signature block header is invalid");
                 return NPDRM_ERR_INVALID_DATA;
             }
             if (get32le(sig_header + 8) == 0 || get32le(sig_header + 8) != expected_signatures)
             {
-                sys_close(unicv);
                 pfs_free_unicv_table_list(out_tables);
                 set_error(error_message, error_message_size, "unicv.db signature count does not match sectors");
                 return NPDRM_ERR_INVALID_DATA;
             }
 
-            sys_read(unicv, sig_block_offset + 16u, t->first_signature, 20u);
+            st = source->read(source->ctx, UNICV_DB_PATH, sig_block_offset + 16u, 20u, t->first_signature, error_message, error_message_size);
+            if (st != NPDRM_OK)
+            {
+                pfs_free_unicv_table_list(out_tables);
+                return st;
+            }
             t->has_first_signature = 1;
             out_tables->nonempty_count++;
         }
 
         i += (uint64_t)(1u + sig_blocks);
     }
-
-    sys_close(unicv);
 
     if (error_message != NULL && error_message_size > 0)
     {
@@ -1285,7 +1303,7 @@ void pfs_free_unicv_table_list(pfs_unicv_table_list* tables)
     tables->nonempty_count = 0;
 }
 
-npdrm_status pfs_map_unicv_tables_verified(const char* title_src_dir, const pfs_filesdb_header* header, const pfs_filesdb_inventory* inventory, const pfs_unicv_table_list* tables, const uint8_t* klicensee, uint32_t klicensee_size, const uint8_t* content_key, uint32_t content_key_size, pfs_unicv_file_mapping* out_mapping, char* error_message, uint32_t error_message_size)
+npdrm_status pfs_map_unicv_tables_verified(const pfs_source* source, const pfs_filesdb_header* header, const pfs_filesdb_inventory* inventory, const pfs_unicv_table_list* tables, const uint8_t* klicensee, uint32_t klicensee_size, const uint8_t* content_key, uint32_t content_key_size, pfs_unicv_file_mapping* out_mapping, char* error_message, uint32_t error_message_size)
 {
     pfs_probe_file_candidate* files = NULL;
     uint32_t file_count = 0;
@@ -1293,7 +1311,7 @@ npdrm_status pfs_map_unicv_tables_verified(const char* title_src_dir, const pfs_
     uint32_t processed_tables = 0;
     npdrm_status st;
 
-    if (title_src_dir == NULL || header == NULL || inventory == NULL || tables == NULL || out_mapping == NULL)
+    if (source == NULL || header == NULL || inventory == NULL || tables == NULL || out_mapping == NULL)
     {
         set_error(error_message, error_message_size, "invalid verified unicv mapping request");
         return NPDRM_ERR_INVALID_ARG;
@@ -1305,7 +1323,7 @@ npdrm_status pfs_map_unicv_tables_verified(const char* title_src_dir, const pfs_
         return NPDRM_OK;
     }
 
-    st = collect_probe_candidates(title_src_dir, inventory, tables, &files, &file_count, error_message, error_message_size);
+    st = collect_probe_candidates(source, inventory, tables, &files, &file_count, error_message, error_message_size);
     if (st != NPDRM_OK)
     {
         return st;
@@ -1501,15 +1519,11 @@ void pfs_free_unicv_file_mapping(pfs_unicv_file_mapping* mapping)
     mapping->unmatched_count = 0;
 }
 
-npdrm_status pfs_probe_title_layout(const char* title_src_dir, pfs_probe_result* out_probe, char* error_message, uint32_t error_message_size)
+npdrm_status pfs_probe_title_layout(const pfs_source* source, pfs_probe_result* out_probe, char* error_message, uint32_t error_message_size)
 {
-    char sce_pfs_path[PFS_MAX_PATH];
-    char files_db_path[PFS_MAX_PATH];
-    char unicv_path[PFS_MAX_PATH];
-    char icv_dir_path[PFS_MAX_PATH];
     pfs_filesdb_header header;
 
-    if (title_src_dir == NULL || out_probe == NULL)
+    if (source == NULL || out_probe == NULL)
     {
         set_error(error_message, error_message_size, "invalid pfs probe request");
         return NPDRM_ERR_INVALID_ARG;
@@ -1517,45 +1531,23 @@ npdrm_status pfs_probe_title_layout(const char* title_src_dir, pfs_probe_result*
 
     memset(out_probe, 0, sizeof(*out_probe));
 
-    if (!path_exists_dir(title_src_dir))
+    if (source->size_of(source->ctx, FILES_DB_PATH) == 0)
     {
-        set_error(error_message, error_message_size, "title source directory does not exist");
+        set_error(error_message, error_message_size, "sce_pfs/files.db not found");
         return NPDRM_ERR_INVALID_DATA;
     }
 
-    join_path2(sce_pfs_path, sizeof(sce_pfs_path), title_src_dir, "sce_pfs");
-    if (sce_pfs_path[0] == 0 || !path_exists_dir(sce_pfs_path))
+    out_probe->has_unicv = source->size_of(source->ctx, UNICV_DB_PATH) != 0 ? 1 : 0;
+    if (!out_probe->has_unicv)
     {
-        set_error(error_message, error_message_size, "sce_pfs directory not found");
+        set_error(error_message, error_message_size, "sce_pfs/unicv.db not found");
         return NPDRM_ERR_INVALID_DATA;
     }
 
-    join_path3(files_db_path, sizeof(files_db_path), title_src_dir, "sce_pfs", "files.db");
-    if (files_db_path[0] == 0 || !path_exists_file(files_db_path))
-    {
-        set_error(error_message, error_message_size, "files.db not found in sce_pfs");
-        return NPDRM_ERR_INVALID_DATA;
-    }
-
-    join_path3(unicv_path, sizeof(unicv_path), title_src_dir, "sce_pfs", "unicv.db");
-    join_path3(icv_dir_path, sizeof(icv_dir_path), title_src_dir, "sce_pfs", "icv.db");
-
-    out_probe->has_unicv = path_exists_file(unicv_path) ? 1 : 0;
-    out_probe->has_icv_dir = path_exists_dir(icv_dir_path) ? 1 : 0;
-
-    if (!out_probe->has_unicv && !out_probe->has_icv_dir)
-    {
-        set_error(error_message, error_message_size, "neither unicv.db nor icv.db directory found");
-        return NPDRM_ERR_INVALID_DATA;
-    }
-
-    if (pfs_read_filesdb_header(files_db_path, &header, error_message, error_message_size) != NPDRM_OK)
+    if (pfs_read_filesdb_header(source, &header, error_message, error_message_size) != NPDRM_OK)
     {
         return NPDRM_ERR_INVALID_DATA;
     }
-
-    out_probe->files_db_size = file_size_bytes(files_db_path);
-    snprintf(out_probe->files_db_path, sizeof(out_probe->files_db_path), "%s", files_db_path);
 
     if (error_message != NULL && error_message_size > 0)
     {
@@ -1575,7 +1567,7 @@ npdrm_status pfs_extract_decrypted_title(const pfs_request* request, char* error
     npdrm_status st;
     uint32_t i;
 
-    if (request == NULL || request->title_src_dir == NULL || request->title_dst_dir == NULL)
+    if (request == NULL || request->source == NULL || request->title_dst_dir == NULL)
     {
         return NPDRM_ERR_INVALID_ARG;
     }
@@ -1590,7 +1582,7 @@ npdrm_status pfs_extract_decrypted_title(const pfs_request* request, char* error
     memset(&tables, 0, sizeof(tables));
     memset(&mapping, 0, sizeof(mapping));
 
-    st = pfs_probe_title_layout(request->title_src_dir, &probe, error_message, error_message_size);
+    st = pfs_probe_title_layout(request->source, &probe, error_message, error_message_size);
     if (st != NPDRM_OK)
     {
         return st;
@@ -1602,31 +1594,27 @@ npdrm_status pfs_extract_decrypted_title(const pfs_request* request, char* error
         return NPDRM_ERR_NOT_IMPLEMENTED;
     }
 
-    st = pfs_read_filesdb_header(probe.files_db_path, &header, error_message, error_message_size);
+    st = pfs_read_filesdb_header(request->source, &header, error_message, error_message_size);
     if (st != NPDRM_OK)
     {
         return st;
     }
 
-    st = pfs_collect_filesdb_inventory(probe.files_db_path, &header, &inventory, error_message, error_message_size);
+    st = pfs_collect_filesdb_inventory(request->source, &header, &inventory, error_message, error_message_size);
     if (st != NPDRM_OK)
     {
         return st;
     }
 
+    st = pfs_collect_unicv_tables(request->source, &tables, error_message, error_message_size);
+    if (st != NPDRM_OK)
     {
-        char unicv_path[PFS_MAX_PATH];
-        snprintf(unicv_path, sizeof(unicv_path), "%s/sce_pfs/unicv.db", request->title_src_dir);
-        st = pfs_collect_unicv_tables(unicv_path, &tables, error_message, error_message_size);
-        if (st != NPDRM_OK)
-        {
-            pfs_free_filesdb_inventory(&inventory);
-            return st;
-        }
+        pfs_free_filesdb_inventory(&inventory);
+        return st;
     }
 
     st = pfs_map_unicv_tables_verified(
-        request->title_src_dir,
+        request->source,
         &header,
         &inventory,
         &tables,
@@ -1662,8 +1650,8 @@ npdrm_status pfs_extract_decrypted_title(const pfs_request* request, char* error
     for (i = 0; i < inventory.count; i++)
     {
         const pfs_filesdb_inventory_entry* entry = &inventory.entries[i];
-        char src_path[PFS_MAX_PATH];
         char dst_path[PFS_MAX_PATH];
+        uint64_t src_size;
 
         if (entry->path[0] == 0)
         {
@@ -1683,8 +1671,8 @@ npdrm_status pfs_extract_decrypted_title(const pfs_request* request, char* error
             continue;
         }
 
-        join_path2(src_path, sizeof(src_path), request->title_src_dir, entry->path);
-        if (!path_exists_file(src_path))
+        src_size = request->source->size_of(request->source->ctx, entry->path);
+        if (src_size == 0 && entry->size != 0)
         {
             st = NPDRM_ERR_INVALID_DATA;
             set_error(error_message, error_message_size, "expected encrypted title file is missing");
@@ -1704,7 +1692,7 @@ npdrm_status pfs_extract_decrypted_title(const pfs_request* request, char* error
 
         if ((entry->effective_type & FILES_DB_ATTR_NENC) != 0u)
         {
-            st = copy_file_raw(src_path, dst_path);
+            st = copy_source_file_raw(request->source, entry->path, src_size, dst_path, error_message, error_message_size);
             if (st != NPDRM_OK)
             {
                 set_error(error_message, error_message_size, "failed to copy unencrypted title file");
@@ -1723,14 +1711,18 @@ npdrm_status pfs_extract_decrypted_title(const pfs_request* request, char* error
             }
 
             st = decrypt_unicv_file_to_path(
-                src_path,
+                request->source,
+                entry->path,
+                src_size,
                 dst_path,
                 header.files_salt,
                 map->table_page,
                 map->file_sector_size,
                 request->content_key,
                 map->has_dbseed ? map->dbseed : NULL,
-                map->has_dbseed ? (uint32_t)sizeof(map->dbseed) : 0u);
+                map->has_dbseed ? (uint32_t)sizeof(map->dbseed) : 0u,
+                error_message,
+                error_message_size);
             if (st != NPDRM_OK)
             {
                 set_error(error_message, error_message_size, "failed to decrypt unicv title file");
