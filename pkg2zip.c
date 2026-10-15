@@ -376,6 +376,115 @@ static const char* get_region(const char* id) {
     }
 }
 
+static int file_exists(const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (f == NULL)
+    {
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+
+// Reads exactly rif_size bytes of raw RIF data from path. Returns 0 (without erroring) if the
+// file doesn't exist, so callers can treat a missing file as "no RIF here" rather than fatal.
+static int try_read_raw_rif(const char* path, uint8_t* rif, uint32_t rif_size)
+{
+    FILE* f;
+    size_t n;
+    uint8_t extra;
+
+    if (path == NULL)
+    {
+        return 0;
+    }
+    f = fopen(path, "rb");
+    if (f == NULL)
+    {
+        return 0;
+    }
+
+    n = fread(rif, 1, rif_size, f);
+    if (n == rif_size && fread(&extra, 1, 1, f) != 0)
+    {
+        n = 0; // file is larger than a real RIF -- treat as not a valid match
+    }
+    fclose(f);
+    return n == rif_size;
+}
+
+static void find_work_bin_beside_pkg(const char* pkg_path, char* out, size_t out_size)
+{
+    const char* slash = strrchr(pkg_path, '/');
+    const char* backslash = strrchr(pkg_path, '\\');
+    if (backslash != NULL && (slash == NULL || backslash > slash))
+    {
+        slash = backslash;
+    }
+
+    if (slash == NULL)
+    {
+        snprintf(out, out_size, "work.bin");
+    }
+    else
+    {
+        size_t dir_len = (size_t)(slash - pkg_path) + 1;
+        if (dir_len >= out_size)
+        {
+            dir_len = out_size - 1;
+        }
+        memcpy(out, pkg_path, dir_len);
+        out[dir_len] = 0;
+        sys_vstrncat(out, out_size, "work.bin");
+    }
+}
+
+static int has_rif_source(const char* pkg_arg, const char* rif_path_arg, const char* zrif_arg)
+{
+    char work_bin_path[1024];
+
+    if (zrif_arg != NULL || rif_path_arg != NULL)
+    {
+        return 1;
+    }
+
+    find_work_bin_beside_pkg(pkg_arg, work_bin_path, sizeof(work_bin_path));
+    return file_exists(work_bin_path);
+}
+
+// Loads rif_size bytes of RIF data, trying (in order): an explicit -r|--rif path, a positional
+// zRIF string, then a work.bin found next to the pkg file. Returns 1 if a RIF was loaded into
+// `rif`, 0 if none of the sources were available.
+static int load_rif(const char* rif_path_arg, const char* zrif_arg, const char* pkg_arg, uint8_t* rif, uint32_t rif_size)
+{
+    if (rif_path_arg != NULL)
+    {
+        if (!try_read_raw_rif(rif_path_arg, rif, rif_size))
+        {
+            sys_error("ERROR: failed to read a %u-byte RIF from '%s'\n", rif_size, rif_path_arg);
+        }
+        return 1;
+    }
+
+    if (zrif_arg != NULL)
+    {
+        zrif_decode(zrif_arg, rif, rif_size);
+        return 1;
+    }
+
+    {
+        char work_bin_path[1024];
+        find_work_bin_beside_pkg(pkg_arg, work_bin_path, sizeof(work_bin_path));
+        if (try_read_raw_rif(work_bin_path, rif, rif_size))
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 void print_help(char* bin_name)
 {
     sys_output("Parameters:\n");
@@ -385,7 +494,8 @@ void print_help(char* bin_name)
     sys_output("-b|--no-bgdl       Disable bgdl output for VITA Theme extraction\n");
     sys_output("-q|--quiet         Do not output anything to stdout\n");
     sys_output("-h|--help          Shows this help message\n");
-    sys_output("-n|--npdrm         Decrypt Vita APP/DLC/PATCH/Theme content straight from the pkg into a NPDRM-removed title tree (requires positional zRIF)\n");
+    sys_output("-n|--npdrm         Decrypt Vita APP/DLC/PATCH/Theme content straight from the pkg into a NPDRM-removed title tree (requires a RIF, see -r)\n");
+    sys_output("-r|--rif <path>    Use a raw RIF/work.bin file instead of a positional zRIF. If neither is given, a 'work.bin' next to the pkg is used if present\n");
     sys_output("\n");
     sys_output("PSP/PSX only options:\n");
     sys_output("-c[NUM]            Create a *.CSO file instead of ISO. [NUM] is the compression ratio\n");
@@ -394,7 +504,7 @@ void print_help(char* bin_name)
     sys_output("PSM only options:\n");
 	sys_output("-a|--android-psm   Extract into PSM for Android format.\n");
     sys_output("\n");
-    sys_output("Usage: %s [-x] [-n] [-c[N]] [-b] [-p] <file.pkg> [zRIF]\n", bin_name);
+    sys_output("Usage: %s [-x] [-n] [-r <path>] [-c[N]] [-b] [-p] <file.pkg> [zRIF]\n", bin_name);
 }
 
 typedef enum {
@@ -424,6 +534,8 @@ int main(int argc, char* argv[])
 	int android = 0;
     const char* pkg_arg = NULL;
     const char* zrif_arg = NULL;
+    const char* rif_path_arg = NULL;
+    int have_rif = 0;
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "-x") == 0 || strcmp(argv[i], "--extract") == 0)
@@ -474,6 +586,14 @@ int main(int argc, char* argv[])
         {
             npdrm_decrypt = 1;
         }
+        else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--rif") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                sys_error("ERROR: -r|--rif requires a path argument\n");
+            }
+            rif_path_arg = argv[++i];
+        }
         else
         {
             if (pkg_arg != NULL )
@@ -498,9 +618,9 @@ int main(int argc, char* argv[])
         exit(1);
     }
 
-    if (npdrm_decrypt && zrif_arg == NULL)
+    if (npdrm_decrypt && !has_rif_source(pkg_arg, rif_path_arg, zrif_arg))
     {
-        sys_error("ERROR: -n|--npdrm requires a positional zRIF argument\n");
+        sys_error("ERROR: -n|--npdrm requires a positional zRIF, -r|--rif <path>, or a work.bin next to the pkg\n");
     }
 
     if (verbose)
@@ -688,10 +808,10 @@ int main(int argc, char* argv[])
         if(strcmp(id, "") == 0)
           id = (char*)pkg_header + 0x37;
         
-        if (type == PKG_TYPE_PSX && zrif_arg != NULL)  //pocketstation pkg type is PSX
+        if (type == PKG_TYPE_PSX)  //pocketstation pkg type is PSX
         {
             rif_size = 512;
-            zrif_decode(zrif_arg, rif, rif_size);
+            have_rif = load_rif(rif_path_arg, zrif_arg, pkg_arg, rif, rif_size);
         }
     }
     else if (type == PKG_TYPE_PSP_THEME)
@@ -750,13 +870,13 @@ int main(int argc, char* argv[])
             }
         }
 
-        if (type != PKG_TYPE_VITA_PATCH && zrif_arg != NULL)
+        have_rif = load_rif(rif_path_arg, zrif_arg, pkg_arg, rif, rif_size);
+        if (type != PKG_TYPE_VITA_PATCH && have_rif)
         {
-            zrif_decode(zrif_arg, rif, rif_size);
             const char* rif_contentid = (char*)rif + (type == PKG_TYPE_VITA_PSM ? 0x50 : 0x10);
             if (strncmp(rif_contentid, content, 0x30) != 0)
             {
-                sys_error("ERROR: zRIF content id '%s' doesn't match pkg '%s'\n", rif_contentid, content);
+                sys_error("ERROR: RIF content id '%s' doesn't match pkg '%s'\n", rif_contentid, content);
             }
         }
     }
@@ -766,7 +886,8 @@ int main(int argc, char* argv[])
         sys_error("ERROR: -n|--npdrm currently supports Vita APP, PATCH, DLC, and Theme packages only\n");
     }
 
-    const char* ext = zipped ? ".zip" : "";
+    // -n|--npdrm always writes a plain directory tree, never a zip.
+    const char* ext = (zipped && !npdrm_decrypt) ? ".zip" : "";
 
     char root[1024];
     if (type == PKG_TYPE_PSP)
@@ -868,7 +989,9 @@ int main(int argc, char* argv[])
 
     if (verbose)
     {
-        if (zipped)
+        if (npdrm_decrypt)
+            sys_output("[*] indexing pkg contents for NPDRM decryption\n");
+        else if (zipped)
             sys_output("[*] creating '%s' archive\n", root);
         else
             sys_output("[*] unpacking '%s' to directory\n", root);
@@ -1266,7 +1389,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    if (verbose)
+    if (verbose && !npdrm_decrypt)
     {
         if (zipped)
             sys_output("[*] creating completed\n");
@@ -1331,7 +1454,7 @@ int main(int argc, char* argv[])
         out_end_file();
     }
 
-    if ((type == PKG_TYPE_VITA_APP || type == PKG_TYPE_VITA_DLC || type == PKG_TYPE_VITA_PSM || type == PKG_TYPE_VITA_THEME || type == PKG_TYPE_PSX) && zrif_arg != NULL)
+    if ((type == PKG_TYPE_VITA_APP || type == PKG_TYPE_VITA_DLC || type == PKG_TYPE_VITA_PSM || type == PKG_TYPE_VITA_THEME || type == PKG_TYPE_PSX) && have_rif)
     {
         if (type == PKG_TYPE_VITA_PSM)
         {
@@ -1522,7 +1645,8 @@ int main(int argc, char* argv[])
         memset(&np_req, 0, sizeof(np_req));
         np_req.source = &source;
         np_req.title_dst_dir = np_title_dst_dir;
-        np_req.zrif = zrif_arg;
+        np_req.rif = have_rif ? rif : NULL;
+        np_req.rif_size = have_rif ? rif_size : 0;
 
         if (verbose)
         {
