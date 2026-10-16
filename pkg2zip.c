@@ -6,6 +6,7 @@
 #include "pkg2zip_zrif.h"
 #include "pkg2zip_npdrm.h"
 #include "pkg2zip_pfs.h"
+#include "pkg2zip_sha256.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -1129,6 +1130,18 @@ int main(int argc, char* argv[])
     pfs_pkg_item* npdrm_items = NULL;
     uint32_t npdrm_item_count = 0;
 
+    // A console install turns sce_sys/package/digs.bin (or cert.bin) into body.bin: one SHA-256 per item,
+    // in item-table order, encrypted with the package key (written after the loop below). Directories,
+    // sce_pfs/pflist (not installed) and digs.bin/cert.bin itself keep an all-zero row.
+    int vita_package = (type == PKG_TYPE_VITA_APP || type == PKG_TYPE_VITA_DLC || type == PKG_TYPE_VITA_PATCH || type == PKG_TYPE_VITA_THEME);
+    uint8_t* item_digests = NULL;
+    int have_digs = 0;
+    if (vita_package && !npdrm_decrypt)
+    {
+        item_digests = (uint8_t*)sys_realloc(NULL, (size_t)item_count * 32);
+        memset(item_digests, 0, (size_t)item_count * 32);
+    }
+
     for (uint32_t item_index = 0; item_index < item_count; item_index++)
     {
         uint8_t item[32];
@@ -1222,17 +1235,12 @@ int main(int argc, char* argv[])
                 continue;
             }
 
-            int decrypt = 1;
-            if ((type == PKG_TYPE_VITA_APP || type == PKG_TYPE_VITA_DLC || type == PKG_TYPE_VITA_PATCH || type == PKG_TYPE_VITA_THEME) && (strcmp("sce_sys/package/digs.bin", name) == 0 || strcmp("sce_sys/package/cert.bin", name) == 0 ))
+            if (vita_package && (strcmp("sce_sys/package/digs.bin", name) == 0 || strcmp("sce_sys/package/cert.bin", name) == 0 ))
             {
                 snprintf(path, sizeof(path), "%s/sce_sys/package", root);
                 out_add_folder(path);
-                if (verbose)
-                {
-                    sys_output("[*] renaming %s to body.bin\n", name);
-                }
-                snprintf(name, sizeof(name), "%s", "sce_sys/package/body.bin");
-                decrypt = 0;
+                have_digs = 1;
+                continue;
             }
 
             if (type == PKG_TYPE_PS3) {
@@ -1366,6 +1374,10 @@ int main(int argc, char* argv[])
                 snprintf(path, sizeof(path), "%s/%s", root, name);
             }
 
+            int hash_item = (item_digests != NULL && strcmp("sce_pfs/pflist", name) != 0);
+            sha256_ctx item_hash;
+            sha256_init(&item_hash);
+
             uint64_t offset = data_offset;
             out_add_parent(path);
             out_begin_file(path, 0);
@@ -1375,10 +1387,11 @@ int main(int argc, char* argv[])
                 uint32_t size = (uint32_t)min64(data_size, sizeof(buffer));
                 sys_output_progress(enc_offset + offset);
                 sys_read(pkg, enc_offset + offset, buffer, size);
+                aes128_ctr_xor(item_key, iv, offset / 16, buffer, size);
 
-                if (decrypt)
+                if (hash_item)
                 {
-                    aes128_ctr_xor(item_key, iv, offset / 16, buffer, size);
+                    sha256_update(&item_hash, buffer, size);
                 }
 
                 out_write(buffer, size);
@@ -1386,6 +1399,11 @@ int main(int argc, char* argv[])
                 data_size -= size;
             }
             out_end_file();
+
+            if (hash_item)
+            {
+                sha256_final(&item_hash, item_digests + (size_t)item_index * 32);
+            }
         }
     }
 
@@ -1441,6 +1459,24 @@ int main(int argc, char* argv[])
             tail_offset += size;
         }
         out_end_file();
+
+        if (have_digs)
+        {
+            if (verbose)
+            {
+                sys_output("[*] creating sce_sys/package/body.bin\n");
+            }
+            snprintf(path, sizeof(path), "%s/sce_sys/package/body.bin", root);
+
+            // The console encrypts the digests as if they sat at package position 0xFFFFFFFF00000000,
+            // using the same counter rule as every item: iv + (position - enc_offset) / 16, wrapping at 64 bits.
+            uint32_t body_size = item_count * 32;
+            aes128_ctr_xor(&key, iv, (UINT64_C(0xFFFFFFFF00000000) - enc_offset) / 16, item_digests, body_size);
+
+            out_begin_file(path, 0);
+            out_write(item_digests, body_size);
+            out_end_file();
+        }
 
         if (verbose)
         {
