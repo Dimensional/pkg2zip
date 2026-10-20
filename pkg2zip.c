@@ -1375,6 +1375,15 @@ int main(int argc, char* argv[])
                 snprintf(path, sizeof(path), "%s/%s", root, name);
             }
 
+            // sce_pfs/pflist is a package item the console consumes during install but never keeps
+            // in the installed title, so skip writing it to match a console install byte-for-byte.
+            // Its body.bin row stays all-zero (item_digests was zero-filled), as on the console.
+            if ((type == PKG_TYPE_VITA_APP || type == PKG_TYPE_VITA_DLC || type == PKG_TYPE_VITA_PATCH || type == PKG_TYPE_VITA_THEME)
+                && strcmp("sce_pfs/pflist", name) == 0)
+            {
+                continue;
+            }
+
             int hash_item = (item_digests != NULL && strcmp("sce_pfs/pflist", name) != 0);
             sha256_ctx item_hash;
             sha256_init(&item_hash);
