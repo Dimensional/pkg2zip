@@ -6,6 +6,7 @@
 #include "pkg2zip_zrif.h"
 #include "pkg2zip_npdrm.h"
 #include "pkg2zip_pfs.h"
+#include "pkg2zip_sha1.h"
 #include "pkg2zip_sha256.h"
 
 #include <assert.h>
@@ -1428,12 +1429,18 @@ int main(int argc, char* argv[])
         snprintf(path, sizeof(path), "%s/sce_sys/package/head.bin", root);
         out_add_parent(path);
 
-        // SHA-256 of head.bin/body.bin/tail.bin feed the stat.bin "CTX" record (see below).
+        // SHA-256 of the package header / head.bin / body.bin / tail.bin feed the stat.bin
+        // "CTX" record (see below). The header digest is SHA-256(pkg[0:enc_offset]) -- the whole
+        // unencrypted header+metadata -- which is a prefix of head.bin, so it is computed in the
+        // same read loop.
+        uint8_t stat_header_digest[32] = { 0 };
         uint8_t stat_head_digest[32] = { 0 };
         uint8_t stat_body_digest[32] = { 0 };
         uint8_t stat_tail_digest[32] = { 0 };
 
         out_begin_file(path, 0);
+        sha256_ctx stat_header_hash;
+        sha256_init(&stat_header_hash);
         sha256_ctx stat_head_hash;
         sha256_init(&stat_head_hash);
         uint64_t head_size = enc_offset + items_size;
@@ -1445,11 +1452,16 @@ int main(int argc, char* argv[])
             sys_read(pkg, head_offset, buffer, size);
             out_write(buffer, size);
             sha256_update(&stat_head_hash, buffer, size);
+            if (head_offset < enc_offset)
+            {
+                sha256_update(&stat_header_hash, buffer, (uint32_t)min64(size, enc_offset - head_offset));
+            }
             head_size -= size;
             head_offset += size;
         }
         out_end_file();
         sha256_final(&stat_head_hash, stat_head_digest);
+        sha256_final(&stat_header_hash, stat_header_digest);
 
         if (verbose)
         {
@@ -1516,16 +1528,15 @@ int main(int argc, char* argv[])
         // P layout (the CTX blob is P[0x1c:]):
         //   P[0x00:0x04] = "\x7fCTX" magic   P[0x04] = version 0x01   P[0x09] = 0x03
         //   P[0x10:0x14] = enc_offset (LE)
-        //   P[0x1c:0x30] = SHA-1   over the installed content stream   (KNOWN GAP, see below)
-        //   P[0x30:0x50] = SHA-256 over the installed content stream   (KNOWN GAP, see below)
+        //   P[0x1c:0x30] = SHA-1(pkg[0:enc_offset+enc_size])  -- header + encrypted body, no tail
+        //   P[0x30:0x50] = SHA-256(pkg[0:enc_offset])         -- the unencrypted header+metadata
         //   P[0x50:0x70] = SHA-256(head.bin)
         //   P[0x70:0x90] = SHA-256(body.bin)
         //   P[0x90:0xb0] = SHA-256(tail.bin)
         //   P[0xb0:0xb4] = item_count (LE)
         //
-        // KNOWN GAP: P[0x1c:0x50] (the two content hashes, 52 bytes) are running SHA-1/SHA-256
-        // over the game data the console writes during install; the exact hashed byte-stream is
-        // not pinned yet, so this stat.bin does not byte-match a console install yet.
+        // Every field is verified byte-exact against console installs of PCSG01174 / PCSE01235 /
+        // PCSG01091, the Sly Cooper trilogy (PCSA00096/97/98) and Final Fantasy X (PCSE00293).
         uint8_t stat_key[16] = { 0 };
         aes128_ctr_xor(&key, iv, (UINT64_C(0) - 0x10) / 16, stat_key, sizeof(stat_key));
 
@@ -1537,7 +1548,29 @@ int main(int argc, char* argv[])
         stat_plain[4] = 0x01;
         stat_plain[9] = 0x03;
         set32le(stat_plain + 0x10, (uint32_t)enc_offset);
-        // TODO: stat_plain[0x1c:0x30] = SHA-1, stat_plain[0x30:0x50] = SHA-256 of install content.
+
+        // P[0x1c:0x30] = SHA-1 over the raw package bytes [0 : enc_offset + enc_size]
+        // (the header plus the whole encrypted body, excluding the tail). The installer streams
+        // this during install; computed here directly from the package.
+        uint8_t stat_content_digest[20] = { 0 };
+        {
+            sha1_ctx stat_content_hash;
+            sha1_init(&stat_content_hash);
+            uint64_t sha1_size = enc_offset + enc_size;
+            uint64_t sha1_offset = 0;
+            while (sha1_size != 0)
+            {
+                uint8_t PKG_ALIGN(16) buffer[1 << 16];
+                uint32_t size = (uint32_t)min64(sha1_size, sizeof(buffer));
+                sys_read(pkg, sha1_offset, buffer, size);
+                sha1_update(&stat_content_hash, buffer, size);
+                sha1_size -= size;
+                sha1_offset += size;
+            }
+            sha1_final(&stat_content_hash, stat_content_digest);
+        }
+        memcpy(stat_plain + 0x1c, stat_content_digest, 20);
+        memcpy(stat_plain + 0x30, stat_header_digest, 32);
         memcpy(stat_plain + 0x50, stat_head_digest, 32);
         memcpy(stat_plain + 0x70, stat_body_digest, 32);
         memcpy(stat_plain + 0x90, stat_tail_digest, 32);

@@ -2,13 +2,6 @@
 
 #include <string.h>
 
-typedef struct {
-    uint32_t state[5];
-    uint64_t total_size;
-    uint8_t buffer[64];
-    uint32_t buffer_size;
-} sha1_ctx;
-
 static uint32_t sha1_rotl32(uint32_t value, uint32_t shift)
 {
     return (value << shift) | (value >> (32u - shift));
@@ -85,7 +78,7 @@ static void sha1_process_block(sha1_ctx* ctx, const uint8_t block[64])
     ctx->state[4] += e;
 }
 
-static void sha1_init(sha1_ctx* ctx)
+void sha1_init(sha1_ctx* ctx)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->state[0] = 0x67452301u;
@@ -95,7 +88,7 @@ static void sha1_init(sha1_ctx* ctx)
     ctx->state[4] = 0xC3D2E1F0u;
 }
 
-static void sha1_update(sha1_ctx* ctx, const uint8_t* data, uint32_t size)
+void sha1_update(sha1_ctx* ctx, const uint8_t* data, uint32_t size)
 {
     ctx->total_size += size;
 
@@ -120,7 +113,7 @@ static void sha1_update(sha1_ctx* ctx, const uint8_t* data, uint32_t size)
     }
 }
 
-static void sha1_final(sha1_ctx* ctx, uint8_t out[20])
+void sha1_final(sha1_ctx* ctx, uint8_t out[20])
 {
     uint64_t bit_count = ctx->total_size * 8u;
     uint8_t pad = 0x80u;
