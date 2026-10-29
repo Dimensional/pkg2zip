@@ -33,6 +33,21 @@ static const uint8_t pkg_vita_2[] = { 0xe3, 0x1a, 0x70, 0xc9, 0xce, 0x1d, 0xd7, 
 static const uint8_t pkg_vita_3[] = { 0x42, 0x3a, 0xca, 0x3a, 0x2b, 0xd5, 0x64, 0x9f, 0x96, 0x86, 0xab, 0xad, 0x6f, 0xd8, 0x80, 0x1f };
 static const uint8_t pkg_vita_4[] = { 0xaf, 0x07, 0xfd, 0x59, 0x65, 0x25, 0x27, 0xba, 0xf1, 0x33, 0x89, 0x66, 0x8b, 0x17, 0xd9, 0xea };
 
+// The console's package decrypt adds the block offset to the low 64 bits of the IV only: there is no
+// carry into the high half. Item data never gets near that boundary, but body.bin and stat.bin sit at
+// virtual offsets of about 2^60 blocks, so for IVs whose low half is >= ~0xF000000010000000
+// (e.g. PCSE00283, FFX-2 HD USA) a 128-bit add gives the wrong keystream.
+static void aes128_ctr_xor_low64(const aes128_key* key, const uint8_t* iv, uint64_t block, uint8_t* buffer, size_t size)
+{
+    uint8_t counter[16];
+    memcpy(counter, iv, 8);
+    for (size_t off = 0; off < size; off += 16, block++)
+    {
+        set64be(counter + 8, get64be(iv + 8) + block);
+        aes128_ctr_xor(key, counter, 0, buffer + off, min64(16, size - off));
+    }
+}
+
 // http://vitadevwiki.com/vita/System_File_Object_(SFO)_(PSF)#Internal_Structure
 // https://github.com/TheOfficialFloW/VitaShell/blob/1.74/sfo.h#L29
 static void parse_sfo_content(const uint8_t* sfo, uint32_t sfo_size, char* category, char* title, char* content, char* min_version, char* pkg_version, char* discid)
@@ -1505,7 +1520,7 @@ int main(int argc, char* argv[])
             // The console encrypts the digests as if they sat at package position 0xFFFFFFFF00000000,
             // using the same counter rule as every item: iv + (position - enc_offset) / 16, wrapping at 64 bits.
             uint32_t body_size = item_count * 32;
-            aes128_ctr_xor(&key, iv, (UINT64_C(0xFFFFFFFF00000000) - enc_offset) / 16, item_digests, body_size);
+            aes128_ctr_xor_low64(&key, iv, (UINT64_C(0xFFFFFFFF00000000) - enc_offset) / 16, item_digests, body_size);
 
             out_begin_file(path, 0);
             out_write(item_digests, body_size);
@@ -1547,7 +1562,7 @@ int main(int argc, char* argv[])
         // Every field is verified byte-exact against console installs of PCSG01174 / PCSE01235 /
         // PCSG01091, the Sly Cooper trilogy (PCSA00096/97/98) and Final Fantasy X (PCSE00293).
         uint8_t stat_key[16] = { 0 };
-        aes128_ctr_xor(&key, iv, (UINT64_C(0) - 0x10) / 16, stat_key, sizeof(stat_key));
+        aes128_ctr_xor_low64(&key, iv, (UINT64_C(0) - 0x10) / 16, stat_key, sizeof(stat_key));
 
         uint8_t stat_plain[0x2f0] = { 0 };
         stat_plain[0] = 0x7f;
